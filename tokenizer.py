@@ -71,6 +71,28 @@ def java_chunks(text: str) -> List[str]:
 
 SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
 
+# BPE merges don't need to see an entire multi-hundred-MB corpus to be
+# representative — cap tokenizer *training* text by default (the tokenizer
+# is then applied to the full corpus for actual encoding). 40M chars is
+# comfortably enough Java source for a stable vocab at any of this project's
+# preset sizes. Pass max_train_chars=0 to train() / train_cached() to disable.
+DEFAULT_MAX_TRAIN_CHARS = 40_000_000
+
+
+def _sample_text(text: str, max_chars: int, n_windows: int = 20, seed: int = 1337) -> str:
+    """Deterministically sample ~max_chars from `text` as `n_windows` random
+    contiguous slices spread across it (more representative than a single
+    prefix slice, without the cost of shuffling the whole corpus)."""
+    if len(text) <= max_chars:
+        return text
+    import random
+    rng = random.Random(seed)
+    window = max(1, max_chars // n_windows)
+    return "".join(
+        text[start:start + window]
+        for start in (rng.randint(0, len(text) - window) for _ in range(n_windows))
+    )
+
 
 def _count_pairs(ids: List[int], stats: Dict[Tuple[int, int], int]) -> None:
     for a, b in zip(ids, ids[1:]):
@@ -131,18 +153,55 @@ class JavaBPETokenizer:
     # -- training -------------------------------------------------------
 
     def train(self, text: str, vocab_size: int, verbose: bool = False,
-              show_progress: bool = True) -> None:
+              show_progress: bool = True, max_train_chars: int = DEFAULT_MAX_TRAIN_CHARS) -> None:
+        """Train BPE merges on `text`.
+
+        Uses an incremental pair-count index: after each merge, only the
+        chunks that actually contained the merged pair are rescanned, not
+        the whole corpus. Naive BPE (recount every pair, over every chunk,
+        on every merge) is O(num_merges * corpus_size) — fine for a toy
+        corpus, but intractable once the corpus reaches real-world sizes
+        (hundreds of MB): with vocab_size=8192 (~7900 merges) over a 300MB
+        corpus, naive recounting means hundreds of billions of operations in
+        pure Python. Restricting each merge to only its affected chunks cuts
+        that to roughly O(corpus_size + num_merges * avg_affected_chunk_size).
+
+        `max_train_chars`: BPE merges don't need to see the entire corpus to
+        be representative — pass None/0 to disable and use the full text.
+        """
         n_special = len(SPECIAL_TOKENS)
         if vocab_size < 256 + n_special:
             raise ValueError(f"vocab_size must be >= {256 + n_special}")
         num_merges = vocab_size - 256 - n_special
 
+        if max_train_chars and len(text) > max_train_chars:
+            print(f"Corpus is {len(text):,} chars; sampling {max_train_chars:,} chars "
+                  f"(20 windows spread across the corpus) to train the tokenizer — BPE "
+                  f"merges generalize fine from a representative sample, and this keeps "
+                  f"training tractable. Pass max_train_chars=0 to force the full corpus.")
+            text = _sample_text(text, max_train_chars)
+
+        t0 = time.time()
         chunks = [c for c in java_chunks(text) if c]
         ids_list = [list(c.encode("utf-8")) for c in chunks]
+        total_tokens = sum(len(ids) for ids in ids_list)
+        print(f"Pre-tokenized {len(text):,} chars -> {len(chunks):,} chunks "
+              f"({total_tokens:,} byte-tokens) in {time.time() - t0:.1f}s")
 
         merges: Dict[Tuple[int, int], int] = {}
         vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
         train_start = time.time()
+
+        # Global pair -> count, and pair -> {chunk indices containing it}.
+        # The latter is what lets each merge skip untouched chunks.
+        pair_counts: Dict[Tuple[int, int], int] = {}
+        where: Dict[Tuple[int, int], set] = {}
+        for idx, ids in enumerate(ids_list):
+            local: Dict[Tuple[int, int], int] = {}
+            _count_pairs(ids, local)
+            for p, c in local.items():
+                pair_counts[p] = pair_counts.get(p, 0) + c
+                where.setdefault(p, set()).add(idx)
 
         # Progress bar shows: merge number/total, % complete, ETA (tqdm's
         # bar format includes all three natively) and current vocab size
@@ -156,17 +215,42 @@ class JavaBPETokenizer:
             bar = None
 
         for i in range(num_merges):
-            stats: Dict[Tuple[int, int], int] = {}
-            for ids in ids_list:
-                _count_pairs(ids, stats)
-            if not stats:
+            if not pair_counts:
                 if verbose:
                     print(f"\nRan out of unique pairs after {i} merges "
                           f"(corpus too small for vocab_size={vocab_size}); stopping early.")
                 break
-            pair = max(stats, key=stats.get)
+            pair = max(pair_counts, key=pair_counts.get)
             new_id = 256 + i
-            ids_list = [_merge(ids, pair, new_id) for ids in ids_list]
+            affected = where.pop(pair, set())
+
+            for idx in affected:
+                ids = ids_list[idx]
+
+                old_local: Dict[Tuple[int, int], int] = {}
+                _count_pairs(ids, old_local)
+                for p, c in old_local.items():
+                    pair_counts[p] = pair_counts.get(p, 0) - c
+                    if pair_counts[p] <= 0:
+                        del pair_counts[p]
+
+                new_ids = _merge(ids, pair, new_id)
+                ids_list[idx] = new_ids
+
+                new_local: Dict[Tuple[int, int], int] = {}
+                _count_pairs(new_ids, new_local)
+                for p, c in new_local.items():
+                    pair_counts[p] = pair_counts.get(p, 0) + c
+                    where.setdefault(p, set()).add(idx)
+
+                for p in old_local:
+                    if p not in new_local:
+                        s = where.get(p)
+                        if s is not None:
+                            s.discard(idx)
+                            if not s:
+                                del where[p]
+
             merges[pair] = new_id
             vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
             current_vocab_size = 256 + len(merges) + n_special
@@ -179,7 +263,7 @@ class JavaBPETokenizer:
                     bar.update(current_vocab_size)
             if verbose and (i + 1) % 100 == 0:
                 print(f"  merge {i + 1}/{num_merges}: {pair} -> {new_id} "
-                      f"({vocab[new_id]!r}, count={stats[pair]})")
+                      f"({vocab[new_id]!r}, chunks_touched={len(affected)})")
 
         if bar is not None:
             bar.close()
@@ -230,7 +314,8 @@ class JavaBPETokenizer:
 
     def train_cached(self, text: str, vocab_size: int,
                       cache_path: str = "data/tok_cache.pkl",
-                      verbose: bool = False, force: bool = False) -> "JavaBPETokenizer":
+                      verbose: bool = False, force: bool = False,
+                      max_train_chars: int = DEFAULT_MAX_TRAIN_CHARS) -> "JavaBPETokenizer":
         """Like train(), but skips training entirely if a cache at
         `cache_path` was built from this exact (corpus text, vocab_size)
         pair, and writes one after training otherwise.
@@ -258,7 +343,7 @@ class JavaBPETokenizer:
             except (pickle.UnpicklingError, EOFError, KeyError, AttributeError):
                 print(f"Cache at {cache_path} is unreadable — retraining.")
 
-        self.train(text, vocab_size=vocab_size, verbose=verbose)
+        self.train(text, vocab_size=vocab_size, verbose=verbose, max_train_chars=max_train_chars)
 
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "wb") as f:
@@ -315,6 +400,9 @@ def _main():
     ap.add_argument("--cache", default="data/tok_cache.pkl",
                      help="pickle cache path; reused on a matching corpus+vocab_size")
     ap.add_argument("--no-cache", action="store_true", help="ignore/overwrite the cache")
+    ap.add_argument("--max-train-chars", type=int, default=DEFAULT_MAX_TRAIN_CHARS,
+                     help="cap on corpus chars used for training (0 = use full corpus); "
+                          f"default {DEFAULT_MAX_TRAIN_CHARS:,}")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -330,7 +418,8 @@ def _main():
     print(f"Training BPE tokenizer: vocab_size={vocab_size}, corpus={len(text):,} chars")
     tok = JavaBPETokenizer()
     tok.train_cached(text, vocab_size=vocab_size, cache_path=args.cache,
-                      verbose=args.verbose, force=args.no_cache)
+                      verbose=args.verbose, force=args.no_cache,
+                      max_train_chars=args.max_train_chars)
     tok.save(args.output)
     print(f"Saved tokenizer ({tok.vocab_size} tokens) -> {args.output}")
 
