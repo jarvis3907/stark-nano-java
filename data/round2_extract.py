@@ -27,7 +27,7 @@ Output:
 import os
 import time
 import zipfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 try:
     from tqdm import tqdm
@@ -88,29 +88,48 @@ def main():
     os.makedirs(RAW_DIR, exist_ok=True)
 
     zip_paths = sorted(
-        os.path.join(ZIPS_DIR, f) for f in os.listdir(ZIPS_DIR) if f.endswith('.zip')
+        (os.path.join(ZIPS_DIR, f) for f in os.listdir(ZIPS_DIR) if f.endswith('.zip')),
+        key=os.path.getsize,  # smallest first -- fast visible progress before the big ones
     )
     if not zip_paths:
         raise SystemExit(f"No .zip files found in {ZIPS_DIR}.")
 
-    n_workers = min(len(zip_paths), os.cpu_count() or 4)
+    # This work is I/O-bound (reading zips, writing many small files to one
+    # directory), not CPU-bound -- unlike compute-bound work, throwing more
+    # parallel workers at it past a point doesn't help and can actively hurt
+    # by overwhelming the storage backend's I/O queue (seen live: most
+    # worker processes sitting in 'D' state -- uninterruptible sleep on I/O
+    # -- at ~0.3-3.5% CPU each, not doing real work, just contending).
+    n_workers = min(len(zip_paths), 4)
     print(f"Extracting {len(zip_paths)} zips using {n_workers} parallel workers ...")
 
     total = 0
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=n_workers) as ex:
         futures = {ex.submit(_extract_one_zip, p, RAW_DIR): p for p in zip_paths}
-        completed = as_completed(futures)
+        pending = set(futures)
         bar = tqdm(total=len(futures), desc="Extracting", unit="zip") if _HAVE_TQDM else None
-        for fut in completed:
-            zip_name, kept, err = fut.result()
-            total += kept
-            msg = f"  {'❌' if err else '✅'} {zip_name}: " + (err if err else f"{kept} files")
-            if bar is not None:
-                bar.write(msg)
-                bar.update(1)
-            else:
-                print(msg)
+        HEARTBEAT_S = 15
+        while pending:
+            done, pending = wait(pending, timeout=HEARTBEAT_S, return_when=FIRST_COMPLETED)
+            if not done:
+                # Nothing finished in the last HEARTBEAT_S seconds -- say so
+                # explicitly instead of leaving a silent gap that's
+                # indistinguishable from a genuine hang.
+                elapsed = time.time() - t0
+                n_done = len(futures) - len(pending)
+                hb = f"  ... still working ({n_done}/{len(futures)} done, {elapsed:.0f}s elapsed, no completions in {HEARTBEAT_S}s)"
+                bar.write(hb) if bar is not None else print(hb)
+                continue
+            for fut in done:
+                zip_name, kept, err = fut.result()
+                total += kept
+                msg = f"  {'❌' if err else '✅'} {zip_name}: " + (err if err else f"{kept} files")
+                if bar is not None:
+                    bar.write(msg)
+                    bar.update(1)
+                else:
+                    print(msg)
         if bar is not None:
             bar.close()
 
