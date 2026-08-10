@@ -59,7 +59,12 @@ def ensure_tokenizer(cfg: ModelConfig, data_dir: str, retrain: bool = False) -> 
 
     print(f"Training tokenizer: vocab_size={cfg.vocab_size} on {len(text):,} chars ...")
     tok = JavaBPETokenizer()
-    tok.train(text, vocab_size=cfg.vocab_size)
+    # train_cached: if this exact (corpus, vocab_size) pair was trained before
+    # (e.g. switching back to a preset used earlier), reuse data/tok_cache.pkl
+    # instead of retraining — useful when tokenizer.json was deleted/retrained
+    # for a different preset in between.
+    cache_path = os.path.join(data_dir, "tok_cache.pkl")
+    tok.train_cached(text, vocab_size=cfg.vocab_size, cache_path=cache_path, force=retrain)
     tok.save(tok_path)
     print(f"Saved tokenizer -> {tok_path}")
     return tok

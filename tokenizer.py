@@ -19,12 +19,25 @@ across them. Two benefits for a Java model:
 
 Encoding still falls back to raw UTF-8 bytes for anything the regex chunker
 doesn't special-case, so the tokenizer can never fail to encode a string.
+
+Training is cached: `train_cached()` (used by the CLI and by train.py) hashes
+the corpus text + vocab_size and, on a match, loads the previously-trained
+tokenizer from `data/tok_cache.pkl` instead of retraining from scratch.
 """
 import argparse
+import hashlib
 import json
 import os
+import pickle
 import re
+import time
 from typing import Dict, List, Tuple
+
+try:
+    from tqdm import tqdm
+    _HAVE_TQDM = True
+except ImportError:
+    _HAVE_TQDM = False
 
 # ----------------------------------------------------------------------------
 # Java-aware pre-tokenizer
@@ -78,6 +91,30 @@ def _merge(ids: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
     return out
 
 
+class _FallbackProgress:
+    """Minimal progress reporter used when tqdm isn't installed. Shows merge
+    number/total, percent complete, ETA, and a `vocab=` postfix — same info
+    tqdm would show, just printed on a refreshed line instead of a bar."""
+
+    def __init__(self, total: int, desc: str = ""):
+        self.total = total
+        self.desc = desc
+        self.start = time.time()
+        self.n = 0
+
+    def update(self, vocab_size: int):
+        self.n += 1
+        elapsed = time.time() - self.start
+        rate = self.n / elapsed if elapsed > 0 else 0
+        remaining = (self.total - self.n) / rate if rate > 0 else 0
+        pct = 100 * self.n / self.total if self.total else 100
+        print(f"\r{self.desc} {self.n}/{self.total} ({pct:5.1f}%) "
+              f"ETA {remaining:5.0f}s vocab={vocab_size}", end="", flush=True)
+
+    def close(self):
+        print()  # newline after the last \r-updated line
+
+
 class JavaBPETokenizer:
     """Byte-level BPE tokenizer with Java-aware pre-tokenization.
 
@@ -93,7 +130,8 @@ class JavaBPETokenizer:
 
     # -- training -------------------------------------------------------
 
-    def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
+    def train(self, text: str, vocab_size: int, verbose: bool = False,
+              show_progress: bool = True) -> None:
         n_special = len(SPECIAL_TOKENS)
         if vocab_size < 256 + n_special:
             raise ValueError(f"vocab_size must be >= {256 + n_special}")
@@ -104,21 +142,50 @@ class JavaBPETokenizer:
 
         merges: Dict[Tuple[int, int], int] = {}
         vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+        train_start = time.time()
+
+        # Progress bar shows: merge number/total, % complete, ETA (tqdm's
+        # bar format includes all three natively) and current vocab size
+        # (via postfix). Falls back to a plain-text reporter if tqdm isn't
+        # installed, showing the same four numbers.
+        if show_progress and _HAVE_TQDM:
+            bar = tqdm(total=num_merges, desc="Training BPE", unit="merge")
+        elif show_progress:
+            bar = _FallbackProgress(num_merges, desc="Training BPE")
+        else:
+            bar = None
 
         for i in range(num_merges):
             stats: Dict[Tuple[int, int], int] = {}
             for ids in ids_list:
                 _count_pairs(ids, stats)
             if not stats:
+                if verbose:
+                    print(f"\nRan out of unique pairs after {i} merges "
+                          f"(corpus too small for vocab_size={vocab_size}); stopping early.")
                 break
             pair = max(stats, key=stats.get)
             new_id = 256 + i
             ids_list = [_merge(ids, pair, new_id) for ids in ids_list]
             merges[pair] = new_id
             vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
+            current_vocab_size = 256 + len(merges) + n_special
+
+            if bar is not None:
+                if _HAVE_TQDM:
+                    bar.set_postfix(vocab=current_vocab_size)
+                    bar.update(1)
+                else:
+                    bar.update(current_vocab_size)
             if verbose and (i + 1) % 100 == 0:
                 print(f"  merge {i + 1}/{num_merges}: {pair} -> {new_id} "
                       f"({vocab[new_id]!r}, count={stats[pair]})")
+
+        if bar is not None:
+            bar.close()
+            mins, secs = divmod(time.time() - train_start, 60)
+            print(f"✅ Done! {len(merges)} merges in {int(mins)}m {secs:04.1f}s "
+                  f"(vocab_size={256 + len(merges) + n_special})")
 
         self.merges = merges
         self.vocab = vocab
@@ -158,6 +225,51 @@ class JavaBPETokenizer:
                 continue  # control tokens don't contribute text
             parts.append(self.vocab.get(i, b"?"))
         return b"".join(parts).decode("utf-8", errors="replace")
+
+    # -- training with caching --------------------------------------------
+
+    def train_cached(self, text: str, vocab_size: int,
+                      cache_path: str = "data/tok_cache.pkl",
+                      verbose: bool = False, force: bool = False) -> "JavaBPETokenizer":
+        """Like train(), but skips training entirely if a cache at
+        `cache_path` was built from this exact (corpus text, vocab_size)
+        pair, and writes one after training otherwise.
+
+        The cache is keyed by a hash of the corpus text + vocab_size, not
+        just cache_path's existence, so a changed corpus or vocab_size is
+        detected and correctly triggers a retrain instead of silently
+        reusing a stale tokenizer.
+        """
+        fingerprint = hashlib.sha1(text.encode("utf-8")).hexdigest() + f":{vocab_size}"
+
+        if not force and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                if cached.get("fingerprint") == fingerprint:
+                    self.merges = cached["merges"]
+                    self.vocab = cached["vocab"]
+                    self.special_tokens = cached["special_tokens"]
+                    print(f"✅ Loaded cached tokenizer from {cache_path} "
+                          f"({self.vocab_size} tokens) — skipping training")
+                    return self
+                print(f"Cache at {cache_path} doesn't match this corpus/vocab_size "
+                      f"— retraining.")
+            except (pickle.UnpicklingError, EOFError, KeyError, AttributeError):
+                print(f"Cache at {cache_path} is unreadable — retraining.")
+
+        self.train(text, vocab_size=vocab_size, verbose=verbose)
+
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump({
+                "fingerprint": fingerprint,
+                "merges": self.merges,
+                "vocab": self.vocab,
+                "special_tokens": self.special_tokens,
+            }, f)
+        print(f"✅ Tokenizer cached -> {cache_path}")
+        return self
 
     # -- persistence -------------------------------------------------------
 
@@ -200,6 +312,9 @@ def _main():
     ap.add_argument("--output", default="data/tokenizer.json", help="where to save the tokenizer")
     ap.add_argument("--vocab-size", type=int, default=None,
                      help="defaults to the active config's vocab_size")
+    ap.add_argument("--cache", default="data/tok_cache.pkl",
+                     help="pickle cache path; reused on a matching corpus+vocab_size")
+    ap.add_argument("--no-cache", action="store_true", help="ignore/overwrite the cache")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -214,7 +329,8 @@ def _main():
 
     print(f"Training BPE tokenizer: vocab_size={vocab_size}, corpus={len(text):,} chars")
     tok = JavaBPETokenizer()
-    tok.train(text, vocab_size=vocab_size, verbose=args.verbose)
+    tok.train_cached(text, vocab_size=vocab_size, cache_path=args.cache,
+                      verbose=args.verbose, force=args.no_cache)
     tok.save(args.output)
     print(f"Saved tokenizer ({tok.vocab_size} tokens) -> {args.output}")
 

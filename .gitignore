@@ -5,6 +5,7 @@ data/extended/
 data/*.bin
 data/synthetic*.txt
 data/tokenizer.json
+data/tok_cache.pkl
 data/corpus_stats.json
 data/meta.json
 checkpoints/

@@ -2,7 +2,9 @@
 torch>=2.1.0
 numpy>=1.24.0
 
-# Nice-to-have progress bars in data/download.py-style scripts
+# Tokenizer training progress bar (tokenizer.py falls back to a plain-text
+# reporter if this isn't installed, so it's not a hard requirement, but the
+# main pipeline expects it)
 tqdm>=4.65.0
 
 # Optional: only needed for `python data/download.py --source huggingface`
