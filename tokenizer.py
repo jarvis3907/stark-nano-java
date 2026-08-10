@@ -277,6 +277,18 @@ class JavaBPETokenizer:
             vocab[new_id] = vocab[pair[0]] + vocab[pair[1]]
             current_vocab_size = 256 + len(merges) + n_special
 
+            # Surface exactly why a merge is slow, without needing --verbose:
+            # if a single merge touches a huge number of unique chunks (very
+            # common byte-pair across a large, diverse vocabulary), print it
+            # so it's visible *why*, instead of an unexplained slow tick.
+            if len(affected) > 20_000:
+                msg = (f"  [merge {i + 1}/{num_merges}] {pair} -> {new_id} "
+                       f"({vocab[new_id]!r}) touches {len(affected):,} unique chunks")
+                if bar is not None and _HAVE_TQDM:
+                    bar.write(msg)
+                else:
+                    print(("\n" if bar is not None else "") + msg)
+
             if bar is not None:
                 if _HAVE_TQDM:
                     bar.set_postfix(vocab=current_vocab_size)
