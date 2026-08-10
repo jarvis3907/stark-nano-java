@@ -18,6 +18,12 @@ safe to run either before or after round2_extract.py).
 import os
 import zipfile
 
+try:
+    from tqdm import tqdm
+    _HAVE_TQDM = True
+except ImportError:
+    _HAVE_TQDM = False
+
 # Anchored to this script's own location, not the caller's working
 # directory -- same reasoning as the other data/round2_*.py scripts.
 ROUND2_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "round2")
@@ -42,16 +48,23 @@ def main():
             continue
         try:
             with zipfile.ZipFile(zip_path) as z:
-                java_files = [
-                    f for f in z.namelist()
-                    if f.endswith('.java') or f.endswith('.kt')
+                # infolist() (not namelist()) so file_size is available --
+                # lets us skip decompressing entries that can't possibly
+                # pass the size filter, instead of always decompressing
+                # then throwing the result away. Matters a lot here: these
+                # repos have plenty of oversized generated/data files.
+                java_entries = [
+                    info for info in z.infolist()
+                    if (info.filename.endswith('.java') or info.filename.endswith('.kt'))
+                    and MIN_CHARS < info.file_size < MAX_CHARS
                 ]
                 kept = 0
-                for f in java_files:
+                iterator = tqdm(java_entries, desc=f"  {name}", unit="file") if _HAVE_TQDM else java_entries
+                for info in iterator:
                     try:
-                        content = z.read(f).decode('utf-8', errors='ignore')
+                        content = z.read(info).decode('utf-8', errors='ignore')
                         if MIN_CHARS < len(content) < MAX_CHARS:
-                            safe = f.replace('/', '_')
+                            safe = info.filename.replace('/', '_')
                             with open(os.path.join(RAW_DIR, safe), 'w') as out:
                                 out.write(content)
                             kept += 1
