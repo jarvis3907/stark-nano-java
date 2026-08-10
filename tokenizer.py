@@ -156,15 +156,26 @@ class JavaBPETokenizer:
               show_progress: bool = True, max_train_chars: int = DEFAULT_MAX_TRAIN_CHARS) -> None:
         """Train BPE merges on `text`.
 
-        Uses an incremental pair-count index: after each merge, only the
-        chunks that actually contained the merged pair are rescanned, not
-        the whole corpus. Naive BPE (recount every pair, over every chunk,
-        on every merge) is O(num_merges * corpus_size) — fine for a toy
-        corpus, but intractable once the corpus reaches real-world sizes
-        (hundreds of MB): with vocab_size=8192 (~7900 merges) over a 300MB
-        corpus, naive recounting means hundreds of billions of operations in
-        pure Python. Restricting each merge to only its affected chunks cuts
-        that to roughly O(corpus_size + num_merges * avg_affected_chunk_size).
+        Two optimizations over textbook/naive BPE (recount every pair, over
+        every chunk, on every merge — O(num_merges * corpus_size), which for
+        vocab_size=8192 (~7900 merges) over a 300MB corpus means hundreds of
+        billions of operations in pure Python, i.e. effectively never):
+
+          1. Deduplicate identical chunks and weight by frequency. Source
+             code repeats the same tokens constantly (`public`, `;`, common
+             identifiers) — a chunk like "public" might occur 500,000 times
+             as 500,000 separate list objects. Processing each occurrence
+             separately means a merge touching "public" does 500,000x the
+             work of a merge touching some rare identifier that appears
+             once, even though it's structurally the same computation
+             repeated. Deduplicating turns a corpus with millions of raw
+             occurrences into typically a few hundred thousand *unique*
+             chunk shapes, each processed once and weighted by its count —
+             this is the dominant cost and by far the bigger win.
+          2. An incremental pair-count index (pair -> count, pair -> {unique
+             chunk indices containing it}) so each merge only revisits
+             unique chunks that actually contained the merged pair, not
+             every unique chunk in the corpus.
 
         `max_train_chars`: BPE merges don't need to see the entire corpus to
         be representative — pass None/0 to disable and use the full text.
@@ -183,24 +194,34 @@ class JavaBPETokenizer:
 
         t0 = time.time()
         chunks = [c for c in java_chunks(text) if c]
-        ids_list = [list(c.encode("utf-8")) for c in chunks]
-        total_tokens = sum(len(ids) for ids in ids_list)
-        print(f"Pre-tokenized {len(text):,} chars -> {len(chunks):,} chunks "
-              f"({total_tokens:,} byte-tokens) in {time.time() - t0:.1f}s")
+
+        chunk_counts: Dict[str, int] = {}
+        for c in chunks:
+            chunk_counts[c] = chunk_counts.get(c, 0) + 1
+        unique_chunks = list(chunk_counts.keys())
+        mult = [chunk_counts[c] for c in unique_chunks]  # occurrence count per unique chunk
+        ids_list = [list(c.encode("utf-8")) for c in unique_chunks]
+
+        total_tokens = sum(len(ids) * m for ids, m in zip(ids_list, mult))
+        print(f"Pre-tokenized {len(text):,} chars -> {len(chunks):,} chunks, "
+              f"{len(unique_chunks):,} unique ({total_tokens:,} byte-tokens) "
+              f"in {time.time() - t0:.1f}s")
 
         merges: Dict[Tuple[int, int], int] = {}
         vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
         train_start = time.time()
 
-        # Global pair -> count, and pair -> {chunk indices containing it}.
-        # The latter is what lets each merge skip untouched chunks.
+        # Global pair -> weighted count, and pair -> {unique-chunk indices
+        # containing it}. The latter is what lets each merge skip untouched
+        # (unique) chunks.
         pair_counts: Dict[Tuple[int, int], int] = {}
         where: Dict[Tuple[int, int], set] = {}
         for idx, ids in enumerate(ids_list):
             local: Dict[Tuple[int, int], int] = {}
             _count_pairs(ids, local)
+            m = mult[idx]
             for p, c in local.items():
-                pair_counts[p] = pair_counts.get(p, 0) + c
+                pair_counts[p] = pair_counts.get(p, 0) + c * m
                 where.setdefault(p, set()).add(idx)
 
         # Progress bar shows: merge number/total, % complete, ETA (tqdm's
@@ -226,11 +247,12 @@ class JavaBPETokenizer:
 
             for idx in affected:
                 ids = ids_list[idx]
+                m = mult[idx]
 
                 old_local: Dict[Tuple[int, int], int] = {}
                 _count_pairs(ids, old_local)
                 for p, c in old_local.items():
-                    pair_counts[p] = pair_counts.get(p, 0) - c
+                    pair_counts[p] = pair_counts.get(p, 0) - c * m
                     if pair_counts[p] <= 0:
                         del pair_counts[p]
 
@@ -240,7 +262,7 @@ class JavaBPETokenizer:
                 new_local: Dict[Tuple[int, int], int] = {}
                 _count_pairs(new_ids, new_local)
                 for p, c in new_local.items():
-                    pair_counts[p] = pair_counts.get(p, 0) + c
+                    pair_counts[p] = pair_counts.get(p, 0) + c * m
                     where.setdefault(p, set()).add(idx)
 
                 for p in old_local:
