@@ -1,38 +1,154 @@
-🦾 Stark-Nano-Java-100M Round 1 Evaluation
+🦾 Round 1 Evaluation
 ============================================================
 
 Test: Basic POJO
-Prompt: public class User {
-    private Long id;
 ----------------------------------------
+Loaded stark-nano-java-100M (iter 19000, val_loss=0.3614)
+
+===== sample 1/1 =====
+public class User {
+    private Long id;
+
+    private String name;
+
+    private boolean email;
+
+    public User() {
+    }
+
+    public User(Long id, String name, boolean email) {
+        this.id = id;
+        this.name = name;
+        this.email = email;
+    }
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public boolean isEmail() {
+        return email;
+
 
 ============================================================
 
 Test: REST Controller
-Prompt: @RestController
-public class UserController {
 ----------------------------------------
+Loaded stark-nano-java-100M (iter 19000, val_loss=0.3614)
+
+===== sample 1/1 =====
+@RestController
+public class UserController {
+
+    private final UserRepository userRepository;
+
+    public UserController(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<User> findUser(@PathVariable("id") Long id, @Context UriInfo uriInfo) {
+        User user = userRepository.findById(id)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+
+        user.setName(user.getName());
+        user.setEmail(user.getEmail());
+        user.setActivated(user.isActivated());
+        userRepository.save(user);
+
+        return ResponseEntity.ok(user);
+
 
 ============================================================
 
 Test: JPA Entity
-Prompt: @Entity
+----------------------------------------
+Loaded stark-nano-java-100M (iter 19000, val_loss=0.3614)
+
+===== sample 1/1 =====
+@Entity
 public class Product {
-----------------------------------------
 
-============================================================
+    @Id
+    @GeneratedValue(strategy = GenerationType.SEQUENCE)
+    private long id;
 
-Test: JUnit Test
-Prompt: @Test
-public void givenUser_whenSave_thenFound() {
-----------------------------------------
+    private String name;
+
+    private float price;
+
+    private String category;
+
+    private String category;
+
+    public Product() {
+    }
+
+    public Product(String name, float price, String category, String category) {
+        this.name = name;
+        this.price = price;
+        this.category = category;
+        this.category = category;
+    }
+
+    public void setId(long id) {
+        this.id = id;
+    }
+
+    public long getId() {
+        return id;
+    }
+
+    public void setId
 
 ============================================================
 
 Test: Spring Service
-Prompt: @Service
-public class OrderService {
 ----------------------------------------
+Loaded stark-nano-java-100M (iter 19000, val_loss=0.3614)
+
+===== sample 1/1 =====
+@Service
+public class OrderService {
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Transactional
+    public Order createOrder(final Product product) {
+        return orderRepository.save(product);
+    }
+
+    @Transactional
+    public Order createOrder(final Product product) {
+        return orderRepository.save(product);
+    }
+}
+package com.baeldung.lombok.equalsandhashcode.include.methodlevel;
+
+
+import org.junit.Test;
+
+import java.util.Objects;
+
+import static org.junit.Assert.assertEquals;
+
+public class EqualsAndHashCodeUnitTest {
+
+    @Test
+    public void whenUsingEqualsAndHashCodeOnClassLevelAndExcludedFields_thenTwoObjectsAreEqualAndHaveSameHashCodeIfExcludedFieldsAreSame() {
+        Employee
 
 ============================================================
 
