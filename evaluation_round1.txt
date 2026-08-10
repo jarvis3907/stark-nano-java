@@ -1,0 +1,38 @@
+🦾 Stark-Nano-Java-100M Round 1 Evaluation
+============================================================
+
+Test: Basic POJO
+Prompt: public class User {
+    private Long id;
+----------------------------------------
+
+============================================================
+
+Test: REST Controller
+Prompt: @RestController
+public class UserController {
+----------------------------------------
+
+============================================================
+
+Test: JPA Entity
+Prompt: @Entity
+public class Product {
+----------------------------------------
+
+============================================================
+
+Test: JUnit Test
+Prompt: @Test
+public void givenUser_whenSave_thenFound() {
+----------------------------------------
+
+============================================================
+
+Test: Spring Service
+Prompt: @Service
+public class OrderService {
+----------------------------------------
+
+============================================================
+
