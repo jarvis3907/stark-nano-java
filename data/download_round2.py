@@ -32,7 +32,7 @@ repos = [
     ("spring-projects/spring-data-commons", "main"),
     # JPA/ORM
     ("hibernate/hibernate-orm", "main"),
-    ("querydsl/querydsl", "main"),
+    ("querydsl/querydsl", "master"),
     # Testing
     ("mockito/mockito", "main"),
     ("assertj/assertj-core", "main"),

@@ -43,7 +43,7 @@ curl -L --fail --connect-timeout 15 --max-time 300 -o hibernate-orm.zip \
   "https://codeload.github.com/hibernate/hibernate-orm/zip/refs/heads/main"
 
 curl -L --fail --connect-timeout 15 --max-time 300 -o querydsl.zip \
-  "https://codeload.github.com/querydsl/querydsl/zip/refs/heads/main"
+  "https://codeload.github.com/querydsl/querydsl/zip/refs/heads/master"
 
 curl -L --fail --connect-timeout 15 --max-time 300 -o mockito.zip \
   "https://codeload.github.com/mockito/mockito/zip/refs/heads/main"
