@@ -329,8 +329,21 @@ class JavaBPETokenizer:
         ids: List[int] = []
         if add_bos:
             ids.append(self.special_tokens["<bos>"])
+        # Memoize per-unique-chunk results within this call: source text
+        # repeats the same tokens constantly (keywords, punctuation, common
+        # identifiers), so without this, encoding a large corpus reruns the
+        # same merge-application loop millions of times over for popular
+        # chunks like "public" or ";" -- same principle as the dedup fix in
+        # train(), applied to encoding instead of merge-counting. Safe to
+        # share cached lists by reference since callers only ever read them
+        # here (extend), never mutate in place.
+        cache: Dict[str, List[int]] = {}
         for chunk in java_chunks(text):
-            ids.extend(self._encode_chunk(chunk.encode("utf-8")))
+            chunk_ids = cache.get(chunk)
+            if chunk_ids is None:
+                chunk_ids = self._encode_chunk(chunk.encode("utf-8"))
+                cache[chunk] = chunk_ids
+            ids.extend(chunk_ids)
         if add_eos:
             ids.append(self.special_tokens["<eos>"])
         return ids
