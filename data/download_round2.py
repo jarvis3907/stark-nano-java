@@ -56,16 +56,26 @@ repos = [
 ]
 
 
+# Anchored to this script's own location (the data/ dir), not the caller's
+# working directory -- so `python data/download_round2.py` from the repo
+# root and `python download_round2.py` from inside data/ both write to the
+# same place instead of the latter creating a stray data/data/round2/.
+ROUND2_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "round2")
+RAW_DIR = os.path.join(ROUND2_DIR, "raw")
+TMP_ZIP = os.path.join(ROUND2_DIR, "tmp.zip")
+CORPUS_PATH = os.path.join(ROUND2_DIR, "corpus_round2.txt")
+
+
 def main():
-    os.makedirs("data/round2/raw", exist_ok=True)
+    os.makedirs(RAW_DIR, exist_ok=True)
     total = 0
 
     for repo, branch in repos:
         print(f"📥 {repo}...")
         url = f"https://codeload.github.com/{repo}/zip/refs/heads/{branch}"
         try:
-            urllib.request.urlretrieve(url, "data/round2/tmp.zip")
-            with zipfile.ZipFile("data/round2/tmp.zip") as z:
+            urllib.request.urlretrieve(url, TMP_ZIP)
+            with zipfile.ZipFile(TMP_ZIP) as z:
                 java_files = [
                     f for f in z.namelist()
                     if f.endswith('.java') or f.endswith('.kt')
@@ -75,12 +85,12 @@ def main():
                     content = z.read(f).decode('utf-8', errors='ignore')
                     if 100 < len(content) < 100000:
                         safe = f.replace('/', '_')
-                        with open(f"data/round2/raw/{safe}", 'w') as out:
+                        with open(os.path.join(RAW_DIR, safe), 'w') as out:
                             out.write(content)
                         kept += 1
                 total += kept
                 print(f"  ✅ {kept} files")
-            os.remove("data/round2/tmp.zip")
+            os.remove(TMP_ZIP)
         except Exception as e:
             print(f"  ❌ {e}")
 
@@ -88,15 +98,15 @@ def main():
 
     # Merge
     print("📝 Merging...")
-    with open("data/round2/corpus_round2.txt", "w") as out:
-        for f in os.listdir("data/round2/raw"):
+    with open(CORPUS_PATH, "w") as out:
+        for f in os.listdir(RAW_DIR):
             try:
-                with open(f"data/round2/raw/{f}") as inp:
+                with open(os.path.join(RAW_DIR, f)) as inp:
                     out.write(inp.read() + "\n\n")
             except Exception:
                 pass
 
-    size = os.path.getsize("data/round2/corpus_round2.txt")
+    size = os.path.getsize(CORPUS_PATH)
     print(f"✅ Round 2 corpus: {size/1e6:.1f}MB")
 
 
