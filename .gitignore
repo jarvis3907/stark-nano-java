@@ -2,6 +2,8 @@
 data/corpus*.txt
 data/raw/
 data/extended/
+data/extended.zip
+data/round2/
 data/*.bin
 data/synthetic*.txt
 data/tokenizer.json
