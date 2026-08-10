@@ -140,7 +140,12 @@ TRAIN_10M = TrainConfig(
     eval_interval=250, eval_iters=50, sample_interval=500,
 )
 TRAIN_100M = TrainConfig(
-    batch_size=16, grad_accum_steps=4, learning_rate=3e-4, min_lr=3e-5,
+    # batch_size=64/grad_accum_steps=1 keeps the same effective batch as the
+    # earlier 16/4 split, just in one round instead of four -- cuts per-iter
+    # Python/kernel-launch overhead ~4x on GPUs with VRAM to spare (fits
+    # comfortably on 24GB+ cards; drop batch_size and raise grad_accum_steps
+    # back up if you hit an OOM on a smaller GPU).
+    batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
     max_iters=20000, warmup_iters=500, lr_decay_iters=20000,
     eval_interval=500, eval_iters=100, sample_interval=1000,
 )
