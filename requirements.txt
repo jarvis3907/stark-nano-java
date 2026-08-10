@@ -1,0 +1,9 @@
+# Core (required)
+torch>=2.1.0
+numpy>=1.24.0
+
+# Nice-to-have progress bars in data/download.py-style scripts
+tqdm>=4.65.0
+
+# Optional: only needed for `python data/download.py --source huggingface`
+# datasets>=2.18.0

@@ -1,0 +1,23 @@
+# Generated data / training artifacts
+data/corpus*.txt
+data/raw/
+data/extended/
+data/*.bin
+data/synthetic*.txt
+data/tokenizer.json
+data/corpus_stats.json
+data/meta.json
+checkpoints/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Local tooling
+.claude/
