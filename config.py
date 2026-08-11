@@ -124,7 +124,7 @@ CONFIG_1M = ModelConfig(
 
 CONFIG_10M = ModelConfig(
     name="stark-nano-java-10M",
-    vocab_size=4096,
+    vocab_size=8192,
     block_size=256,
     n_layer=6,
     n_head=8,
@@ -165,6 +165,7 @@ TRAIN_10M = TrainConfig(
     eval_interval=250, eval_iters=50, sample_interval=500,
 )
 TRAIN_100M = TrainConfig(
+<<<<<<< Updated upstream
     # batch_size=32/grad_accum_steps=2 keeps the same effective batch (64) as
     # the earlier 64/1 split. Halved from 64/1 for Round 3: CONFIG_100M's
     # block_size doubled (512 -> 1024), which roughly doubles per-sample
@@ -173,6 +174,15 @@ TRAIN_100M = TrainConfig(
     # (keeping their product at 64) if you confirm more headroom than this.
     batch_size=32, grad_accum_steps=2, learning_rate=3e-4, min_lr=3e-5,
     max_iters=20000, warmup_iters=500, lr_decay_iters=20000,
+=======
+    # batch_size=64/grad_accum_steps=1 keeps the same effective batch as the
+    # earlier 16/4 split, just in one round instead of four -- cuts per-iter
+    # Python/kernel-launch overhead ~4x on GPUs with VRAM to spare (fits
+    # comfortably on 24GB+ cards; drop batch_size and raise grad_accum_steps
+    # back up if you hit an OOM on a smaller GPU).
+    batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
+    max_iters=40000, warmup_iters=500, lr_decay_iters=40000,
+>>>>>>> Stashed changes
     eval_interval=500, eval_iters=100, sample_interval=1000,
 )
 TRAIN_1B = TrainConfig(

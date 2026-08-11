@@ -1,0 +1,169 @@
+🦾 Round 2 Evaluation
+============================================================
+
+Test: Basic POJO
+----------------------------------------
+Loaded stark-nano-java-100M (iter 39000, val_loss=0.6922)
+
+===== sample 1/1 =====
+public class User {
+    private Long id;
+    private String name;
+
+    public User(Long id, String name) {
+        this.id = id;
+        this.name = name;
+    }
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+}
+package com.baeldung.spring.kafka.delay;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org
+
+============================================================
+
+Test: REST Controller
+----------------------------------------
+Loaded stark-nano-java-100M (iter 39000, val_loss=0.6922)
+
+===== sample 1/1 =====
+@RestController
+public class UserController {
+
+    @GetMapping("/users")
+    public ResponseEntity<String> getUsers(@RequestParam String username) {
+        return ResponseEntity.ok("User retrieved with username: " + username);
+    }
+
+}
+/*
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+
+/*
+ * @test
+ *
+ * @summary converted from VM Testbase nsk/jdi/AttachingConnector/attach/attach003.
+ * VM Testbase keywords: [jpda, jdi]
+ * VM Testbase readme:
+ * DESCRIPTION:
+ *     The test for the implementation of an object of the type
+ *     VirtualMachine.
+ *     The test checks up that a result of the method
+ *     com.sun.jdi.VirtualMachine.attach(Map)
+ *     complies with its specification, that is,
+ *     "mirrored" the AttachingConnector's transport service
+ *     (the default transport services, which can be used to establish connections to
+ *     a Java virtual 
+
+============================================================
+
+Test: JPA Entity
+----------------------------------------
+Loaded stark-nano-java-100M (iter 39000, val_loss=0.6922)
+
+===== sample 1/1 =====
+@Entity
+public class Product {
+
+	@Id
+	@GeneratedValue
+	private Long id;
+
+	private String name;
+
+	@ManyToOne(fetch = FetchType.LAZY, cascade = CascadeType.ALL)
+	@JoinColumn(name = "product_id")
+	private Product product;
+
+	public Product() {
+	}
+
+	public Product(String name) {
+		this.name = name;
+	}
+
+	public Long getId() {
+		return id;
+	}
+
+	public String getName() {
+		return name;
+	}
+
+	public void setName(String name) {
+		this.name = name;
+	}
+
+	public Product getProduct() {
+		return 
+
+============================================================
+
+Test: Spring Service
+----------------------------------------
+Loaded stark-nano-java-100M (iter 39000, val_loss=0.6922)
+
+===== sample 1/1 =====
+@Service
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+
+    public OrderService(OrderRepository orderRepository) {
+        this.orderRepository = orderRepository;
+    }
+
+    @PostMapping("/orders")
+    public void createOrders(@RequestBody Collection<Product> products) {
+
+        Query orderQuery = new Query();
+        orderQuery.setFirstName("Products");
+        orderQuery.setOrderId(products.size() - 1);
+        orderQuery.setPrice(products.get(0).getPrice());
+
+        Order order = getOrderService(orderRepository);
+
+        orderQuery.setPrice(products.size() - 1);
+        orderQuery.setOrderId(products.get(0)
+
+============================================================
+
