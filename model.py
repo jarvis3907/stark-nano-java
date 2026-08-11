@@ -1,11 +1,18 @@
 """
 Stark-Nano-Java — model architecture.
 
-A standard decoder-only (GPT-style) transformer: token + learned position
-embeddings, pre-norm transformer blocks (causal self-attention + MLP with
-residual connections), final LayerNorm, and a linear head tied to the token
-embedding. Every dimension is read from a config.ModelConfig — resize the
-model entirely from config.py, no edits needed here.
+A LLaMA-style decoder-only transformer: token embeddings + RoPE (rotary
+position embeddings, applied inside attention rather than added at the
+input), pre-norm transformer blocks (causal self-attention + SwiGLU MLP
+with residual connections), a final RMSNorm, and a linear head tied to the
+token embedding. Every dimension is read from a config.ModelConfig —
+resize the model entirely from config.py, no edits needed here.
+
+Round 3 architecture change from the original GPT-2-style model (learned
+position embeddings, LayerNorm, GELU MLP): RoPE replaces the learned
+position-embedding table, RMSNorm replaces LayerNorm, and a SwiGLU MLP
+replaces the GELU MLP. This is a breaking change — checkpoints trained
+under the pre-Round-3 architecture are not loadable here.
 """
 import inspect
 import math
@@ -14,20 +21,58 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from config import ModelConfig
+from config import ModelConfig, swiglu_hidden_dim
 
 
-class LayerNorm(nn.Module):
-    """LayerNorm with an optional bias (PyTorch's built-in always has one)."""
+# ----------------------------------------------------------------------------
+# RoPE (Rotary Position Embeddings)
+# ----------------------------------------------------------------------------
 
-    def __init__(self, ndim: int, bias: bool):
+def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 10000.0):
+    """Precompute the cos/sin rotation tables RoPE applies to q/k.
+    head_dim must be even. Returns two (max_seq_len, head_dim/2) tensors."""
+    assert head_dim % 2 == 0, f"RoPE requires an even head_dim, got {head_dim}"
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.outer(t, freqs)  # (max_seq_len, head_dim/2)
+    return torch.cos(freqs), torch.sin(freqs)
+
+
+def apply_rope(q, k, freqs_cos, freqs_sin):
+    """Rotate q and k by their position's RoPE angle.
+    q, k: (batch, n_head, seq_len, head_dim)."""
+    def rotate(x):
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        seq_len = x.shape[-2]
+        cos = freqs_cos[:seq_len].unsqueeze(0).unsqueeze(0)
+        sin = freqs_sin[:seq_len].unsqueeze(0).unsqueeze(0)
+        out1 = x1 * cos - x2 * sin
+        out2 = x1 * sin + x2 * cos
+        return torch.stack([out1, out2], dim=-1).flatten(-2)
+    return rotate(q), rotate(k)
+
+
+# ----------------------------------------------------------------------------
+# RMSNorm
+# ----------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    """Normalizes by root-mean-square rather than LayerNorm's mean+variance;
+    no bias term and no mean-centering, by design."""
+
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return norm * self.weight
 
+
+# ----------------------------------------------------------------------------
+# Attention (RoPE applied to q/k, right after the qkv projection+reshape)
+# ----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: ModelConfig):
@@ -35,11 +80,20 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
         self.dropout = cfg.dropout
+        self.head_dim = cfg.n_embd // cfg.n_head
 
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
+
+        # RoPE tables: precomputed once per module (not per forward pass),
+        # sized to block_size. Non-persistent -- deterministic from
+        # head_dim/block_size/theta, so there's no reason to save/load them
+        # in checkpoints (keeps checkpoint size unaffected by this change).
+        freqs_cos, freqs_sin = precompute_rope_freqs(self.head_dim, cfg.block_size, cfg.rope_theta)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
         # Use PyTorch's fused/flash attention kernel when available (torch>=2.0).
         self.flash = hasattr(F, "scaled_dot_product_attention")
@@ -50,10 +104,12 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        hd = C // self.n_head
+        hd = self.head_dim
         q = q.view(B, T, self.n_head, hd).transpose(1, 2)  # (B, nh, T, hd)
         k = k.view(B, T, self.n_head, hd).transpose(1, 2)
         v = v.view(B, T, self.n_head, hd).transpose(1, 2)
+
+        q, k = apply_rope(q, k, self.freqs_cos, self.freqs_sin)
 
         if self.flash:
             y = F.scaled_dot_product_attention(
@@ -73,25 +129,34 @@ class CausalSelfAttention(nn.Module):
         return self.resid_dropout(self.c_proj(y))
 
 
-class MLP(nn.Module):
-    def __init__(self, cfg: ModelConfig):
+# ----------------------------------------------------------------------------
+# SwiGLU MLP
+# ----------------------------------------------------------------------------
+
+class SwiGLU(nn.Module):
+    def __init__(self, cfg: ModelConfig, hidden_mult: float = 8 / 3):
         super().__init__()
-        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+        # hidden_mult=8/3 (not config-driven, matches config.swiglu_hidden_dim's
+        # default so the two never disagree): SwiGLU uses 3 matrices instead
+        # of a GELU-MLP's 2, so 3 * (8/3) = 8 keeps MLP params roughly
+        # comparable to the old 2-matrix, 4x-wide GELU MLP.
+        hidden_dim = swiglu_hidden_dim(cfg.n_embd, hidden_mult)
+        self.gate_proj = nn.Linear(cfg.n_embd, hidden_dim, bias=cfg.bias)
+        self.up_proj = nn.Linear(cfg.n_embd, hidden_dim, bias=cfg.bias)
+        self.down_proj = nn.Linear(hidden_dim, cfg.n_embd, bias=cfg.bias)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x):
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.ln_1 = LayerNorm(cfg.n_embd, cfg.bias)
+        self.ln_1 = RMSNorm(cfg.n_embd)
         self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = LayerNorm(cfg.n_embd, cfg.bias)
-        self.mlp = MLP(cfg)
+        self.ln_2 = RMSNorm(cfg.n_embd)
+        self.mlp = SwiGLU(cfg)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -106,10 +171,9 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(cfg.vocab_size, cfg.n_embd),
-            wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
             drop=nn.Dropout(cfg.dropout),
             h=nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)]),
-            ln_f=LayerNorm(cfg.n_embd, cfg.bias),
+            ln_f=RMSNorm(cfg.n_embd),
         ))
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
 
@@ -118,9 +182,12 @@ class GPT(nn.Module):
             self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
-        # Scaled init for residual projections, per GPT-2.
+        # Scaled init for residual-branch output projections -- attention's
+        # c_proj and SwiGLU's down_proj (the GELU-MLP's equivalent layer was
+        # also named c_proj; SwiGLU's is down_proj, so both names are
+        # checked) -- per GPT-2/LLaMA convention, for training stability at depth.
         for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
+            if pn.endswith("c_proj.weight") or pn.endswith("down_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
     def _init_weights(self, module):
@@ -132,22 +199,20 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_num_params(self, non_embedding: bool = True) -> int:
-        n = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n -= self.transformer.wpe.weight.numel()
-        return n
+        """Total parameter count. `non_embedding` is kept for call-site
+        compatibility with the pre-Round-3 architecture (which had a learned
+        position-embedding table that could optionally be excluded) -- RoPE
+        has no learned position embedding, so there's nothing to subtract
+        now; both call styles return the same total."""
+        return sum(p.numel() for p in self.parameters())
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
-        device = idx.device
         b, t = idx.shape
         assert t <= self.cfg.block_size, (
             f"sequence length {t} exceeds block_size {self.cfg.block_size}"
         )
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(self.transformer.wte(idx))
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -166,7 +231,7 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """AdamW with weight decay applied only to 2D+ params (matmul weights),
-        not to biases or LayerNorm gains."""
+        not to biases or norm gains."""
         decay, no_decay = [], []
         for p in self.parameters():
             if not p.requires_grad:
@@ -206,8 +271,7 @@ if __name__ == "__main__":
 
     cfg, _ = get_config()
     model = GPT(cfg)
-    print(f"{cfg.name}: {model.get_num_params()/1e6:.3f}M non-embedding params "
-          f"({model.get_num_params(non_embedding=False)/1e6:.3f}M total)")
+    print(f"{cfg.name}: {model.get_num_params()/1e6:.3f}M params")
 
     x = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
     y = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))

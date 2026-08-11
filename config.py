@@ -17,6 +17,19 @@ from typing import Optional
 # Model architecture
 # ============================================================================
 
+def swiglu_hidden_dim(n_embd: int, hidden_mult: float = 8 / 3) -> int:
+    """SwiGLU's hidden-dim convention: ~hidden_mult * n_embd (default 8/3 --
+    SwiGLU uses 3 matrices (gate/up/down) instead of a GELU-MLP's 2, so
+    3 * (8/3) = 8 keeps total MLP params roughly comparable to the old
+    2-matrix, 4x-wide GELU MLP's 2 * 4 = 8), rounded up to a multiple of 64
+    for GPU efficiency. Shared between model.py's SwiGLU module and
+    ModelConfig.approx_params() so the param-count estimate and the actual
+    implementation can never drift apart.
+    """
+    hidden_dim = int(hidden_mult * n_embd)
+    return ((hidden_dim + 63) // 64) * 64
+
+
 @dataclass
 class ModelConfig:
     name: str
@@ -26,29 +39,41 @@ class ModelConfig:
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.0
-    bias: bool = False             # bias terms in Linear/LayerNorm layers
+    bias: bool = False             # bias terms in Linear layers (RMSNorm has none by design)
     tie_weights: bool = True       # tie input embedding & output head weights
+    rope_theta: float = 10000.0    # RoPE base frequency (10000.0 is the standard default)
 
     def __post_init__(self):
         if self.n_embd % self.n_head != 0:
             raise ValueError(
                 f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
             )
+        if (self.n_embd // self.n_head) % 2 != 0:
+            raise ValueError(
+                f"head_dim ({self.n_embd // self.n_head}) must be even for RoPE"
+            )
 
     def approx_params(self) -> int:
         """Rough total parameter count, for sanity-checking a config.
 
-        Uses the standard transformer approximation: each block costs
-        ~12 * n_embd^2 (4 for attention qkv+proj, 8 for the 4x MLP), plus
-        token/position embeddings (and the output head, unless tied).
+        LLaMA-style architecture: RoPE has no learned position-embedding
+        table (unlike the old learned wpe), attention is unchanged
+        (~4 * n_embd^2 for qkv+proj), the MLP is SwiGLU (3 matrices at
+        swiglu_hidden_dim() instead of a GELU-MLP's 2 matrices at 4x), and
+        RMSNorm has only a weight vector (no bias, no mean-centering) --
+        two per block (pre-attn, pre-mlp) plus one final norm.
         """
-        v, b, l, e = self.vocab_size, self.block_size, self.n_layer, self.n_embd
-        embedding = v * e + b * e
-        per_layer = 12 * e * e + 13 * e  # + biases/LayerNorm params (approx)
+        v, l, e = self.vocab_size, self.n_layer, self.n_embd
+        embedding = v * e  # token embedding only -- no learned position embedding under RoPE
+        attn_params = 4 * e * e
+        hidden_dim = swiglu_hidden_dim(e)
+        mlp_params = 3 * e * hidden_dim
+        norm_params = 2 * e  # RMSNorm weight only, x2 per block
+        per_layer = attn_params + mlp_params + norm_params
         body = l * per_layer
         head = 0 if self.tie_weights else v * e
-        final_ln = e
-        return embedding + body + head + final_ln
+        final_norm = e
+        return embedding + body + head + final_norm
 
 
 # ============================================================================
@@ -110,7 +135,7 @@ CONFIG_10M = ModelConfig(
 CONFIG_100M = ModelConfig(
     name="stark-nano-java-100M",
     vocab_size=8192,
-    block_size=512,
+    block_size=1024,  # Round 3: RunPod GPU has headroom, and Java classes routinely exceed 512 tokens
     n_layer=12,
     n_head=12,
     n_embd=768,
@@ -140,12 +165,13 @@ TRAIN_10M = TrainConfig(
     eval_interval=250, eval_iters=50, sample_interval=500,
 )
 TRAIN_100M = TrainConfig(
-    # batch_size=64/grad_accum_steps=1 keeps the same effective batch as the
-    # earlier 16/4 split, just in one round instead of four -- cuts per-iter
-    # Python/kernel-launch overhead ~4x on GPUs with VRAM to spare (fits
-    # comfortably on 24GB+ cards; drop batch_size and raise grad_accum_steps
-    # back up if you hit an OOM on a smaller GPU).
-    batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
+    # batch_size=32/grad_accum_steps=2 keeps the same effective batch (64) as
+    # the earlier 64/1 split. Halved from 64/1 for Round 3: CONFIG_100M's
+    # block_size doubled (512 -> 1024), which roughly doubles per-sample
+    # activation memory, so batch_size needed to come down to stay safely
+    # under 32GB VRAM. Raise batch_size and lower grad_accum_steps back up
+    # (keeping their product at 64) if you confirm more headroom than this.
+    batch_size=32, grad_accum_steps=2, learning_rate=3e-4, min_lr=3e-5,
     max_iters=20000, warmup_iters=500, lr_decay_iters=20000,
     eval_interval=500, eval_iters=100, sample_interval=1000,
 )
