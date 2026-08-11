@@ -181,6 +181,38 @@ What it does, all driven by `TrainConfig`:
   (`sample_interval` in `TrainConfig`) so you can watch the model's Java
   output improve, not just the loss number
 
+### Local/RunPod split workflow
+
+Tokenizer training + corpus encoding is CPU-bound and doesn't need a GPU;
+the training loop is GPU-bound and doesn't need `data/corpus.txt`. Split
+them across machines explicitly with `--prepare-only` / `--skip-prepare`
+instead of re-running (or accidentally re-triggering) prep on a paid GPU box:
+
+```bash
+# ── Local (CPU) ──
+python data/download.py --repos <widened list for this round>
+python train.py --prepare-only --preset 100M
+# → prints a summary (vocab size, token counts, file sizes) and exits —
+#   no model init, no training loop, no GPU touched
+
+# ── Upload just the 4 prepared files — NOT corpus.txt or data/raw/ ──
+scp data/tokenizer.json data/train.bin data/val.bin data/meta.json \
+    runpod:/workspace/stark-nano-java/data/
+
+# ── RunPod (GPU) ──
+python train.py --skip-prepare --preset 100M
+# hard-fails immediately if any of the 4 files are missing, or if
+# meta.json's vocab_size doesn't match the active preset, or if
+# tokenizer.json/meta.json look like they're from different prepare runs
+# (partial sync) — never silently regenerates from a corpus.txt that may
+# not even be on this box
+```
+
+`meta.json` also records a `corpus_hash` (sha1 of `corpus.txt` at prepare
+time) purely as provenance — not enforced on RunPod (there's no
+`corpus.txt` there to compare against), just useful if you need to check
+later whether the local corpus changed since a given prepare run.
+
 ## Generating (`generate.py`)
 
 ```bash

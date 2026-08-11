@@ -14,9 +14,30 @@ Pipeline (all automatic on first run):
      best-val-loss checkpoint, and printing a sample generation. Stops
      early if val_loss hasn't improved for TrainConfig.patience eval
      checks in a row (0 disables this and always runs to max_iters).
+
+Local/RunPod split workflow: prep (tokenizer training + corpus encoding)
+is CPU-bound and doesn't need a GPU; training is GPU-bound and doesn't
+need data/corpus.txt. Split them across machines explicitly instead of
+re-running prep on every box:
+
+    ── Local (CPU) ──
+    python train.py --prepare-only --preset 100M
+    # prints a summary; exits before any model/training code runs
+
+    ── Upload just the 4 prepared files (not corpus.txt/data/raw/) ──
+    scp data/tokenizer.json data/train.bin data/val.bin data/meta.json \\
+        runpod:/workspace/stark-nano-java/data/
+
+    ── RunPod (GPU) ──
+    python train.py --skip-prepare --preset 100M
+    # hard-fails immediately if the 4 files are missing or their
+    # vocab_size doesn't match the active preset, instead of silently
+    # regenerating from a corpus.txt that may not even be on this box
 """
 import argparse
 import csv
+import hashlib
+import json
 import math
 import os
 import time
@@ -27,6 +48,8 @@ import torch
 from config import ModelConfig, TrainConfig, get_config
 from model import GPT
 from tokenizer import JavaBPETokenizer
+
+PREPARED_FILES = ("tokenizer.json", "train.bin", "val.bin", "meta.json")
 
 # ----------------------------------------------------------------------------
 # Data pipeline
@@ -80,7 +103,6 @@ def ensure_bins(cfg: ModelConfig, tok: JavaBPETokenizer, data_dir: str):
     dtype = np.uint16 if tok.vocab_size < 65536 else np.uint32
 
     if os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(meta_path):
-        import json
         with open(meta_path) as f:
             meta = json.load(f)
         if meta.get("vocab_size") == tok.vocab_size:
@@ -100,13 +122,90 @@ def ensure_bins(cfg: ModelConfig, tok: JavaBPETokenizer, data_dir: str):
     train_ids.tofile(train_path)
     val_ids.tofile(val_path)
 
-    import json
+    # Hash of the corpus text this tokenization run was built from -- not
+    # enforced anywhere (RunPod won't have corpus.txt to compare against),
+    # just provenance: if the local corpus changes later without re-running
+    # --prepare-only, this is at least detectable by inspection.
+    corpus_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
     with open(meta_path, "w") as f:
         json.dump({"vocab_size": tok.vocab_size, "train_tokens": len(train_ids),
-                   "val_tokens": len(val_ids)}, f, indent=2)
+                   "val_tokens": len(val_ids), "corpus_hash": corpus_hash}, f, indent=2)
 
     print(f"train.bin: {len(train_ids):,} tokens, val.bin: {len(val_ids):,} tokens")
     return dtype
+
+
+def load_prepared_data_strict(cfg: ModelConfig, data_dir: str):
+    """Strict counterpart to ensure_tokenizer()+ensure_bins(), for
+    --skip-prepare: every prepared-data file must already exist and match
+    the active config's vocab_size exactly. Hard-fails with a clear message
+    instead of silently regenerating anything -- which may not even be
+    possible on a box with no data/corpus.txt (the whole point of
+    --skip-prepare is to guarantee this path never needs one)."""
+    paths = {name: os.path.join(data_dir, name) for name in PREPARED_FILES}
+
+    missing = [p for p in paths.values() if not os.path.exists(p)]
+    if missing:
+        raise SystemExit(
+            "--skip-prepare: missing prepared data file(s):\n"
+            + "\n".join(f"  {p}" for p in missing)
+            + f"\n\nRun `python train.py --prepare-only --preset <name>` locally "
+              f"(active config is {cfg.name}), then sync "
+              f"data/{{{', '.join(PREPARED_FILES)}}} to this box."
+        )
+
+    with open(paths["meta.json"]) as f:
+        meta = json.load(f)
+
+    meta_vocab = meta.get("vocab_size")
+    if meta_vocab != cfg.vocab_size:
+        raise SystemExit(
+            f"--skip-prepare: meta.json says vocab_size={meta_vocab}, active config "
+            f"({cfg.name}) wants vocab_size={cfg.vocab_size} — re-run "
+            f"`python train.py --prepare-only --preset <name>` locally with the right "
+            f"preset, then re-sync data/{{{', '.join(PREPARED_FILES)}}}."
+        )
+
+    tok = JavaBPETokenizer().load(paths["tokenizer.json"])
+    if tok.vocab_size != meta_vocab:
+        raise SystemExit(
+            f"--skip-prepare: tokenizer.json's actual vocab_size ({tok.vocab_size}) "
+            f"doesn't match meta.json's recorded vocab_size ({meta_vocab}) — these files "
+            f"look like they're from different prepare runs (partial sync?). Re-sync "
+            f"data/{{{', '.join(PREPARED_FILES)}}} together as one set."
+        )
+
+    dtype = np.uint16 if tok.vocab_size < 65536 else np.uint32
+    train_tokens = meta.get("train_tokens")
+    val_tokens = meta.get("val_tokens")
+    tt = f"{train_tokens:,}" if isinstance(train_tokens, int) else "?"
+    vt = f"{val_tokens:,}" if isinstance(val_tokens, int) else "?"
+    print(f"--skip-prepare: validated prepared data (vocab_size={tok.vocab_size}, "
+          f"train_tokens={tt}, val_tokens={vt})")
+    return tok, dtype
+
+
+def print_prepare_summary(data_dir: str):
+    paths = {name: os.path.join(data_dir, name) for name in PREPARED_FILES}
+    with open(paths["meta.json"]) as f:
+        meta = json.load(f)
+
+    def size_mb(p):
+        return os.path.getsize(p) / 1e6 if os.path.exists(p) else 0.0
+
+    print("\n" + "=" * 70)
+    print("Prepare complete. Upload exactly these 4 files to your GPU box:")
+    print("=" * 70)
+    for name in PREPARED_FILES:
+        print(f"  {paths[name]:<28s} {size_mb(paths[name]):8.2f} MB")
+    print(f"\n  vocab_size (actual): {meta.get('vocab_size')}")
+    print(f"  train_tokens:        {meta.get('train_tokens', 0):,}")
+    print(f"  val_tokens:          {meta.get('val_tokens', 0):,}")
+    if "corpus_hash" in meta:
+        print(f"  corpus_hash:         {meta['corpus_hash'][:16]}...")
+    print("\n  Do NOT upload data/corpus.txt or data/raw/ — only the 4 files above;")
+    print("  the GPU box never needs raw text, only the tokenized binaries.")
+    print("=" * 70)
 
 
 def get_batch(split, data_dir, dtype, block_size, batch_size, device):
@@ -194,7 +293,25 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--retrain-tokenizer", action="store_true",
                      help="retrain the BPE tokenizer even if data/tokenizer.json exists")
+    ap.add_argument("--prepare-only", action="store_true",
+                     help="train tokenizer + encode corpus into data/{tokenizer.json,train.bin,"
+                          "val.bin,meta.json}, print a summary, and exit -- no model init, no "
+                          "training, no GPU needed. For CPU-only data prep before syncing to a "
+                          "GPU box (see --skip-prepare).")
+    ap.add_argument("--skip-prepare", action="store_true",
+                     help="skip tokenizer training + corpus encoding entirely and go straight "
+                          "to the training loop -- hard-fails if data/{tokenizer.json,train.bin,"
+                          "val.bin,meta.json} are missing or their vocab_size doesn't match the "
+                          "active preset, instead of silently regenerating them (which may need "
+                          "data/corpus.txt -- not expected to exist on this box). Pair with "
+                          "--prepare-only run elsewhere.")
     args = ap.parse_args()
+
+    if args.prepare_only and args.skip_prepare:
+        ap.error("--prepare-only and --skip-prepare are mutually exclusive")
+    if args.skip_prepare and args.retrain_tokenizer:
+        ap.error("--skip-prepare and --retrain-tokenizer are mutually exclusive "
+                  "(--skip-prepare never touches the tokenizer)")
 
     cfg, tc = get_config(args.preset)
     if args.max_iters is not None:
@@ -202,6 +319,13 @@ def main():
         tc.lr_decay_iters = args.max_iters
     if args.device is not None:
         tc.device = args.device
+
+    if args.prepare_only:
+        print(f"Preparing data for {cfg.name} (vocab_size={cfg.vocab_size}) — CPU only, no GPU needed ...")
+        tok = ensure_tokenizer(cfg, tc.data_dir, retrain=args.retrain_tokenizer)
+        ensure_bins(cfg, tok, tc.data_dir)
+        print_prepare_summary(tc.data_dir)
+        return
 
     torch.manual_seed(tc.seed)
     device = pick_device(tc.device)
@@ -216,8 +340,11 @@ def main():
 
     os.makedirs(tc.out_dir, exist_ok=True)
 
-    tok = ensure_tokenizer(cfg, tc.data_dir, retrain=args.retrain_tokenizer)
-    bin_dtype = ensure_bins(cfg, tok, tc.data_dir)
+    if args.skip_prepare:
+        tok, bin_dtype = load_prepared_data_strict(cfg, tc.data_dir)
+    else:
+        tok = ensure_tokenizer(cfg, tc.data_dir, retrain=args.retrain_tokenizer)
+        bin_dtype = ensure_bins(cfg, tok, tc.data_dir)
 
     model = GPT(cfg).to(device)
     print(f"Model: {model.get_num_params()/1e6:.3f}M non-embedding params "
