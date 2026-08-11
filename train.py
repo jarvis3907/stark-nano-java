@@ -185,7 +185,7 @@ def load_prepared_data_strict(cfg: ModelConfig, data_dir: str):
     return tok, dtype
 
 
-def print_prepare_summary(data_dir: str):
+def print_prepare_summary(data_dir: str, cfg: ModelConfig):
     paths = {name: os.path.join(data_dir, name) for name in PREPARED_FILES}
     with open(paths["meta.json"]) as f:
         meta = json.load(f)
@@ -206,6 +206,26 @@ def print_prepare_summary(data_dir: str):
     print("\n  Do NOT upload data/corpus.txt or data/raw/ — only the 4 files above;")
     print("  the GPU box never needs raw text, only the tokenized binaries.")
     print("=" * 70)
+
+    # This is the one place a stale-cache mismatch would otherwise slip by
+    # silently: ensure_tokenizer()/ensure_bins() reuse whatever's already in
+    # data/ (by design, cheap for the common case), but if those cached
+    # files are actually from an unrelated earlier/smaller prepare run, the
+    # only visible sign is a quiet note buried above -- easy to miss right
+    # before uploading the wrong data to a GPU box. Make it impossible to miss.
+    actual_vocab = meta.get("vocab_size")
+    if actual_vocab != cfg.vocab_size:
+        print(f"\n{'!' * 70}")
+        print(f"! WARNING: this looks like STALE cached data, not a fresh prepare run!")
+        print(f"!   Active config ({cfg.name}) wants vocab_size={cfg.vocab_size}")
+        print(f"!   but the prepared files above have vocab_size={actual_vocab}.")
+        print(f"!")
+        print(f"!   If your corpus is genuinely too small to reach {cfg.vocab_size} unique")
+        print(f"!   merges, this is expected and fine. Otherwise, these are almost")
+        print(f"!   certainly leftovers from an earlier/different prepare run --")
+        print(f"!   delete data/{{tokenizer.json,tok_cache.pkl,train.bin,val.bin,meta.json}}")
+        print(f"!   and re-run --prepare-only before uploading anything.")
+        print(f"{'!' * 70}")
 
 
 def get_batch(split, data_dir, dtype, block_size, batch_size, device):
@@ -324,7 +344,7 @@ def main():
         print(f"Preparing data for {cfg.name} (vocab_size={cfg.vocab_size}) — CPU only, no GPU needed ...")
         tok = ensure_tokenizer(cfg, tc.data_dir, retrain=args.retrain_tokenizer)
         ensure_bins(cfg, tok, tc.data_dir)
-        print_prepare_summary(tc.data_dir)
+        print_prepare_summary(tc.data_dir, cfg)
         return
 
     torch.manual_seed(tc.seed)
