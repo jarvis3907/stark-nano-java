@@ -381,27 +381,6 @@ def check_java_compiles(generated_text: str):
         return result.returncode == 0
 
 
-def gpu_stats():
-    """{utilization%, memory used/total MB} via nvidia-smi, or None if it's
-    not available (no NVIDIA GPU, or nvidia-smi missing on this box)."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    util, mem_used, mem_total = result.stdout.strip().split(", ")
-    return {
-        "gpu/utilization": float(util),
-        "gpu/memory_used_mb": float(mem_used),
-        "gpu/memory_total_mb": float(mem_total),
-    }
-
-
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -426,12 +405,19 @@ def main():
                           "active preset, instead of silently regenerating them (which may need "
                           "data/corpus.txt -- not expected to exist on this box). Pair with "
                           "--prepare-only run elsewhere.")
+    ap.add_argument("--compile", action="store_true",
+                     help="override TrainConfig.compile=True -- wrap the model in "
+                          "torch.compile() for this run, without changing the preset's "
+                          "persistent default. Adds warmup/recompilation overhead on the "
+                          "first few iters in exchange for (usually) higher steady-state "
+                          "GPU/Tensor-core utilization.")
     ap.add_argument("--round", type=int, default=1,
                      help="training round number, used only to name the wandb run "
                           "(e.g. --round 4 -> '<model-name>-round4')")
     ap.add_argument("--wandb", action="store_true",
-                     help="log loss/lr/GPU-utilization/sample-generations/compile-rate to "
-                          "Weights & Biases (requires `pip install wandb` and `wandb login`)")
+                     help="log loss/lr/sample-generations/compile-rate to Weights & Biases "
+                          "(requires `pip install wandb` and `wandb login`); GPU/system stats "
+                          "are already captured automatically by wandb itself, no code needed")
     ap.add_argument("--eval-interval", type=int, default=None,
                      help="override TrainConfig.eval_interval -- useful for a short --resume "
                           "smoke test, since eval/checkpoint/wandb-loss-log only fire on "
@@ -465,6 +451,8 @@ def main():
         tc.sample_interval = args.sample_interval
     if args.sample_max_new_tokens is not None:
         tc.sample_max_new_tokens = args.sample_max_new_tokens
+    if args.compile:
+        tc.compile = True
 
     if args.prepare_only:
         print(f"Preparing data for {cfg.name} (vocab_size={cfg.vocab_size}) — CPU only, no GPU needed ...")
@@ -604,11 +592,6 @@ def main():
                           f"({evals_since_improvement * tc.eval_interval} iters), "
                           f"best={best_val_loss:.4f}")
                     break
-
-        if args.wandb and device == "cuda" and (it == start_iter or it % 100 == 0):
-            stats = gpu_stats()
-            if stats:
-                wandb.log({**stats, "train/iter": it})
 
         if tc.sample_interval and it > 0 and it % tc.sample_interval == 0:
             text = sample_generation(model, tok, cfg, device, max_new_tokens=tc.sample_max_new_tokens)
