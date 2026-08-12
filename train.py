@@ -444,6 +444,10 @@ def main():
         tc.lr_decay_iters = args.max_iters
     if args.device is not None:
         tc.device = args.device
+    if args.eval_interval is not None:
+        tc.eval_interval = args.eval_interval
+    if args.sample_interval is not None:
+        tc.sample_interval = args.sample_interval
 
     if args.prepare_only:
         print(f"Preparing data for {cfg.name} (vocab_size={cfg.vocab_size}) — CPU only, no GPU needed ...")
