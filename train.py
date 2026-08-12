@@ -299,7 +299,7 @@ def estimate_loss(model, tc: TrainConfig, cfg: ModelConfig, dtype, device, ctx):
 
 
 @torch.no_grad()
-def sample_generation(model, tok, cfg, device, prompt="public class ", max_new_tokens=80):
+def sample_generation(model, tok, cfg, device, prompt="public class ", max_new_tokens=200):
     model.eval()
     ids = tok.encode(prompt)
     idx = torch.tensor([ids], dtype=torch.long, device=device)
@@ -440,6 +440,11 @@ def main():
     ap.add_argument("--sample-interval", type=int, default=None,
                      help="override TrainConfig.sample_interval, same reasoning as "
                           "--eval-interval")
+    ap.add_argument("--sample-max-new-tokens", type=int, default=None,
+                     help="override TrainConfig.sample_max_new_tokens -- how many tokens the "
+                          "periodic in-loop sample generates. Too short and it won't finish a "
+                          "class before running out (check_java_compiles() then sees only "
+                          "truncated code, not a real quality signal)")
     args = ap.parse_args()
 
     if args.prepare_only and args.skip_prepare:
@@ -458,6 +463,8 @@ def main():
         tc.eval_interval = args.eval_interval
     if args.sample_interval is not None:
         tc.sample_interval = args.sample_interval
+    if args.sample_max_new_tokens is not None:
+        tc.sample_max_new_tokens = args.sample_max_new_tokens
 
     if args.prepare_only:
         print(f"Preparing data for {cfg.name} (vocab_size={cfg.vocab_size}) — CPU only, no GPU needed ...")
@@ -604,7 +611,7 @@ def main():
                 wandb.log({**stats, "train/iter": it})
 
         if tc.sample_interval and it > 0 and it % tc.sample_interval == 0:
-            text = sample_generation(model, tok, cfg, device)
+            text = sample_generation(model, tok, cfg, device, max_new_tokens=tc.sample_max_new_tokens)
             print(f"[sample] iter {it}:\n{'-'*60}\n{text}\n{'-'*60}")
             compiles = check_java_compiles(text)
             if compiles:  # False/None already handled inline (reason printed, or skipped silently)

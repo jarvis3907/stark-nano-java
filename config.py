@@ -99,6 +99,11 @@ class TrainConfig:
     eval_iters: int = 50
     log_interval: int = 10
     sample_interval: int = 500     # print a generation sample this often (0 = never)
+    sample_max_new_tokens: int = 200  # long enough for a typical class to actually close its
+                                       # final brace -- matches generate.py/evaluate.py's own
+                                       # default. Too short and check_java_compiles() sees only
+                                       # truncated code, not a real quality signal (see 80-token
+                                       # default's original samples: none ever closed their class)
     patience: int = 10             # stop after this many eval checks with no val_loss
                                     # improvement (0 = disabled, always run max_iters)
     device: str = "auto"           # "auto" | "cpu" | "cuda" | "mps"
