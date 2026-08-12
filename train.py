@@ -4,6 +4,9 @@ Stark-Nano-Java — training loop.
     python train.py                     # uses config.ACTIVE_CONFIG
     python train.py --preset 10M        # override with a named preset
     python train.py --resume            # continue from the last checkpoint
+    python train.py --wandb --round 4   # also log to Weights & Biases as
+                                         # "<model-name>-round4" (needs
+                                         # `pip install wandb` + `wandb login`)
 
 Pipeline (all automatic on first run):
   1. Make sure data/corpus.txt exists (run data/download.py if not).
@@ -37,9 +40,13 @@ re-running prep on every box:
 import argparse
 import csv
 import hashlib
+import html
 import json
 import math
 import os
+import re
+import subprocess
+import tempfile
 import time
 
 import numpy as np
@@ -302,6 +309,90 @@ def sample_generation(model, tok, cfg, device, prompt="public class ", max_new_t
 
 
 # ----------------------------------------------------------------------------
+# Optional quality/observability helpers (only exercised with --wandb)
+# ----------------------------------------------------------------------------
+
+_JAVAC_AVAILABLE = None
+
+
+def _javac_available() -> bool:
+    global _JAVAC_AVAILABLE
+    if _JAVAC_AVAILABLE is None:
+        try:
+            subprocess.run(["javac", "--version"], capture_output=True, check=True)
+            _JAVAC_AVAILABLE = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            _JAVAC_AVAILABLE = False
+            print("  (javac not found on PATH -- skipping compile-quality checks; "
+                  "install a JDK, e.g. `apt install default-jdk`, to enable them)")
+    return _JAVAC_AVAILABLE
+
+
+def extract_java_class(text: str):
+    """First brace-balanced class block in generated text, or None if there
+    isn't one (e.g. generation got cut off mid-class -- common at low
+    max_new_tokens, not itself a compile failure worth logging as one)."""
+    match = re.search(r"((?:public\s+)?(?:abstract\s+)?(?:final\s+)?class\s+\w+[^{]*\{)", text)
+    if not match:
+        return None
+    start = match.start()
+    depth = 0
+    for i, c in enumerate(text[start:]):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:start + i + 1]
+    return None  # never balanced -- truncated generation, not a real sample
+
+
+def check_java_compiles(generated_text: str):
+    """True/False if the first class in generated_text compiles standalone,
+    None if javac isn't available (caller should skip logging in that case,
+    not count it as a failure)."""
+    if not _javac_available():
+        return None
+    java_class = extract_java_class(generated_text)
+    if not java_class:
+        return False
+    name_match = re.search(r"class\s+(\w+)", java_class)
+    if not name_match:
+        return False
+    with tempfile.TemporaryDirectory() as tmpdir:
+        java_file = os.path.join(tmpdir, f"{name_match.group(1)}.java")
+        with open(java_file, "w") as f:
+            f.write(java_class)
+        try:
+            result = subprocess.run(["javac", java_file], capture_output=True,
+                                     text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return False
+        return result.returncode == 0
+
+
+def gpu_stats():
+    """{utilization%, memory used/total MB} via nvidia-smi, or None if it's
+    not available (no NVIDIA GPU, or nvidia-smi missing on this box)."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    util, mem_used, mem_total = result.stdout.strip().split(", ")
+    return {
+        "gpu/utilization": float(util),
+        "gpu/memory_used_mb": float(mem_used),
+        "gpu/memory_total_mb": float(mem_total),
+    }
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -325,6 +416,20 @@ def main():
                           "active preset, instead of silently regenerating them (which may need "
                           "data/corpus.txt -- not expected to exist on this box). Pair with "
                           "--prepare-only run elsewhere.")
+    ap.add_argument("--round", type=int, default=1,
+                     help="training round number, used only to name the wandb run "
+                          "(e.g. --round 4 -> '<model-name>-round4')")
+    ap.add_argument("--wandb", action="store_true",
+                     help="log loss/lr/GPU-utilization/sample-generations/compile-rate to "
+                          "Weights & Biases (requires `pip install wandb` and `wandb login`)")
+    ap.add_argument("--eval-interval", type=int, default=None,
+                     help="override TrainConfig.eval_interval -- useful for a short --resume "
+                          "smoke test, since eval/checkpoint/wandb-loss-log only fire on "
+                          "absolute-iter boundaries and a short run may not hit any at the "
+                          "preset's default interval")
+    ap.add_argument("--sample-interval", type=int, default=None,
+                     help="override TrainConfig.sample_interval, same reasoning as "
+                          "--eval-interval")
     args = ap.parse_args()
 
     if args.prepare_only and args.skip_prepare:
@@ -351,6 +456,17 @@ def main():
     device = pick_device(tc.device)
     dtype_str = pick_dtype(tc.dtype, device)
     print(f"Config: {cfg.name} | device={device} | dtype={dtype_str}")
+    if device == "cuda":
+        gpu = torch.cuda.get_device_properties(0)
+        print(f"GPU: {gpu.name} | VRAM: {gpu.total_memory/1e9:.1f}GB")
+        print(f"CUDA: {torch.version.cuda} | cuDNN: {torch.backends.cudnn.version()}")
+
+    wandb = None
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit("--wandb requires the wandb package: pip install wandb")
 
     ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_str]
     if device == "cuda":
@@ -393,6 +509,30 @@ def main():
     if log_is_new:
         log_writer.writerow(["iter", "train_loss", "val_loss", "lr", "elapsed_s"])
 
+    if args.wandb:
+        meta_path = os.path.join(tc.data_dir, "meta.json")
+        train_tokens = None
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                train_tokens = json.load(f).get("train_tokens")
+        wandb.init(
+            project="stark-nano-java",
+            name=f"{cfg.name}-round{args.round}",
+            config={
+                "model": cfg.name,
+                "n_layer": cfg.n_layer,
+                "n_head": cfg.n_head,
+                "n_embd": cfg.n_embd,
+                "block_size": cfg.block_size,
+                "vocab_size": cfg.vocab_size,
+                "approx_params": cfg.approx_params(),
+                "max_iters": tc.max_iters,
+                "batch_size": tc.batch_size,
+                "learning_rate": tc.learning_rate,
+                "corpus_tokens": train_tokens,
+            },
+        )
+
     print(f"Training for {tc.max_iters} iters (batch_size={tc.batch_size}, "
           f"grad_accum={tc.grad_accum_steps}, block_size={cfg.block_size}) ...")
 
@@ -413,6 +553,15 @@ def main():
                   f"val_loss={losses['val']:.4f} lr={lr:.2e} elapsed={elapsed:.0f}s")
             log_writer.writerow([it, losses["train"], losses["val"], lr, f"{elapsed:.1f}"])
             log_file.flush()
+
+            if args.wandb:
+                wandb.log({
+                    "train/loss": losses["train"],
+                    "val/loss": losses["val"],
+                    "train/lr": lr,
+                    "train/iter": it,
+                    "train/tokens_seen": it * tc.batch_size * tc.grad_accum_steps * cfg.block_size,
+                })
 
             if losses["val"] < best_val_loss:
                 best_val_loss = losses["val"]
@@ -435,9 +584,22 @@ def main():
                           f"best={best_val_loss:.4f}")
                     break
 
+        if args.wandb and device == "cuda" and (it == start_iter or it % 100 == 0):
+            stats = gpu_stats()
+            if stats:
+                wandb.log({**stats, "train/iter": it})
+
         if tc.sample_interval and it > 0 and it % tc.sample_interval == 0:
             text = sample_generation(model, tok, cfg, device)
             print(f"[sample] iter {it}:\n{'-'*60}\n{text}\n{'-'*60}")
+            compiles = check_java_compiles(text)
+            if compiles is not None:
+                print(f"  javac compile check: {'PASS' if compiles else 'FAIL'}")
+            if args.wandb:
+                log = {"samples/java": wandb.Html(f"<pre>{html.escape(text)}</pre>"), "train/iter": it}
+                if compiles is not None:
+                    log["quality/java_compiles"] = 1.0 if compiles else 0.0
+                wandb.log(log)
 
         optimizer.zero_grad(set_to_none=True)
         for micro in range(tc.grad_accum_steps):
@@ -459,6 +621,8 @@ def main():
 
     log_file.close()
     print(f"Done. Best val_loss={best_val_loss:.4f}. Checkpoint: {ckpt_path}")
+    if args.wandb:
+        wandb.finish()
 
 
 class _NullCtx:

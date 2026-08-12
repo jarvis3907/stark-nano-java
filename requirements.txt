@@ -9,3 +9,6 @@ tqdm>=4.65.0
 
 # Optional: only needed for `python data/download.py --source huggingface`
 # datasets>=2.18.0
+
+# Optional: only needed for `python train.py --wandb`
+# wandb>=0.16.0
