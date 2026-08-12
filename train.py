@@ -350,11 +350,17 @@ def extract_java_class(text: str):
 def check_java_compiles(generated_text: str):
     """True/False if the first class in generated_text compiles standalone,
     None if javac isn't available (caller should skip logging in that case,
-    not count it as a failure)."""
+    not count it as a failure). Prints *why* on any False -- a bare boolean
+    doesn't distinguish "generation got cut off before the class closed"
+    (a max_new_tokens artifact, not a code-quality signal) from "javac
+    actually rejected complete code" (missing-import framework annotations
+    like @RestController/@Entity, or a genuine mistake)."""
     if not _javac_available():
         return None
     java_class = extract_java_class(generated_text)
     if not java_class:
+        print("    javac compile check: FAIL (generation cut off before the class closed -- "
+              "no balanced closing brace; likely a max_new_tokens artifact, not bad code)")
         return False
     name_match = re.search(r"class\s+(\w+)", java_class)
     if not name_match:
@@ -367,7 +373,11 @@ def check_java_compiles(generated_text: str):
             result = subprocess.run(["javac", java_file], capture_output=True,
                                      text=True, timeout=10)
         except subprocess.TimeoutExpired:
+            print("    javac compile check: FAIL (javac timed out)")
             return False
+        if result.returncode != 0:
+            first_err = (result.stderr.strip().splitlines() or ["unknown error"])[0]
+            print(f"    javac compile check: FAIL ({first_err})")
         return result.returncode == 0
 
 
@@ -597,8 +607,8 @@ def main():
             text = sample_generation(model, tok, cfg, device)
             print(f"[sample] iter {it}:\n{'-'*60}\n{text}\n{'-'*60}")
             compiles = check_java_compiles(text)
-            if compiles is not None:
-                print(f"  javac compile check: {'PASS' if compiles else 'FAIL'}")
+            if compiles:  # False/None already handled inline (reason printed, or skipped silently)
+                print("  javac compile check: PASS")
             if args.wandb:
                 log = {"samples/java": wandb.Html(f"<pre>{html.escape(text)}</pre>"), "train/iter": it}
                 if compiles is not None:
