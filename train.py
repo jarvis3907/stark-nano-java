@@ -39,7 +39,6 @@ re-running prep on every box:
 """
 import argparse
 import csv
-import hashlib
 import html
 import json
 import math
@@ -118,30 +117,22 @@ def ensure_bins(cfg: ModelConfig, tok: JavaBPETokenizer, data_dir: str):
 
     corpus_path = os.path.join(data_dir, "corpus.txt")
     corpus_size_mb = os.path.getsize(corpus_path) / 1e6
-    print(f"Reading {corpus_path} ({corpus_size_mb:,.0f} MB) ...")
-    with open(corpus_path, encoding="utf-8", errors="ignore") as f:
-        text = f.read()
+    print(f"Tokenizing {corpus_path} ({corpus_size_mb:,.0f} MB) straight to disk in "
+          f"bounded batches (this is the slow part on a large corpus -- progress bar "
+          f"below tracks it; see encode_file_streaming()'s docstring for why it's "
+          f"streamed instead of one big read()+encode()) ...")
+    n_train, n_val, corpus_hash = tok.encode_file_streaming(
+        corpus_path, dtype, train_path, val_path)
 
-    print("Tokenizing full corpus (this is the slow part on a large corpus -- "
-          "progress bar below tracks it) ...")
-    ids = tok.encode(text, show_progress=True)
-    ids = np.array(ids, dtype=dtype)
-    split = int(0.9 * len(ids))
-    train_ids, val_ids = ids[:split], ids[split:]
-
-    train_ids.tofile(train_path)
-    val_ids.tofile(val_path)
-
-    # Hash of the corpus text this tokenization run was built from -- not
-    # enforced anywhere (RunPod won't have corpus.txt to compare against),
-    # just provenance: if the local corpus changes later without re-running
-    # --prepare-only, this is at least detectable by inspection.
-    corpus_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    # corpus_hash is provenance only, not enforced anywhere (RunPod won't have
+    # corpus.txt to compare against) -- if the local corpus changes later
+    # without re-running --prepare-only, this is at least detectable by
+    # inspection.
     with open(meta_path, "w") as f:
-        json.dump({"vocab_size": tok.vocab_size, "train_tokens": len(train_ids),
-                   "val_tokens": len(val_ids), "corpus_hash": corpus_hash}, f, indent=2)
+        json.dump({"vocab_size": tok.vocab_size, "train_tokens": n_train,
+                   "val_tokens": n_val, "corpus_hash": corpus_hash}, f, indent=2)
 
-    print(f"train.bin: {len(train_ids):,} tokens, val.bin: {len(val_ids):,} tokens")
+    print(f"train.bin: {n_train:,} tokens, val.bin: {n_val:,} tokens")
     return dtype
 
 

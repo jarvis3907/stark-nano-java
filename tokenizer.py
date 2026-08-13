@@ -31,7 +31,9 @@ import os
 import pickle
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 try:
     from tqdm import tqdm
@@ -135,6 +137,36 @@ class _FallbackProgress:
 
     def close(self):
         print()  # newline after the last \r-updated line
+
+
+class _FallbackByteProgress:
+    """tqdm-alike (update(n) advances by n, like tqdm's own update() --
+    doesn't set to n) for byte-based progress when tqdm isn't installed.
+    Throttled to ~2 updates/sec since this gets called once per streamed
+    batch, not once per byte."""
+
+    def __init__(self, total: int, desc: str = ""):
+        self.total = total
+        self.desc = desc
+        self.start = time.time()
+        self.n = 0
+        self._last_print = 0.0
+
+    def update(self, delta: int):
+        self.n += delta
+        now = time.time()
+        if now - self._last_print < 0.5 and self.n < self.total:
+            return
+        self._last_print = now
+        elapsed = now - self.start
+        rate = self.n / elapsed if elapsed > 0 else 0
+        remaining = (self.total - self.n) / rate if rate > 0 else 0
+        pct = 100 * self.n / self.total if self.total else 100
+        print(f"\r{self.desc} {self.n/1e6:,.0f}MB/{self.total/1e6:,.0f}MB "
+              f"({pct:5.1f}%) ETA {remaining:5.0f}s", end="", flush=True)
+
+    def close(self):
+        print()
 
 
 def _fallback_iter_progress(iterable: List[str], desc: str = "", every: int = 200_000):
@@ -343,19 +375,28 @@ class JavaBPETokenizer:
         return ids
 
     def encode(self, text: str, add_bos: bool = False, add_eos: bool = False,
-               show_progress: bool = False) -> List[int]:
+               show_progress: bool = False,
+               cache: Optional[Dict[str, List[int]]] = None) -> List[int]:
         ids: List[int] = []
         if add_bos:
             ids.append(self.special_tokens["<bos>"])
-        # Memoize per-unique-chunk results within this call: source text
-        # repeats the same tokens constantly (keywords, punctuation, common
-        # identifiers), so without this, encoding a large corpus reruns the
-        # same merge-application loop millions of times over for popular
-        # chunks like "public" or ";" -- same principle as the dedup fix in
+        # Memoize per-unique-chunk results: source text repeats the same
+        # tokens constantly (keywords, punctuation, common identifiers), so
+        # without this, encoding a large corpus reruns the same
+        # merge-application loop millions of times over for popular chunks
+        # like "public" or ";" -- same principle as the dedup fix in
         # train(), applied to encoding instead of merge-counting. Safe to
         # share cached lists by reference since callers only ever read them
         # here (extend), never mutate in place.
-        cache: Dict[str, List[int]] = {}
+        #
+        # Pass an external dict to persist the cache *across* calls (see
+        # encode_file_streaming(), which calls encode() once per batch --
+        # without a shared cache, a token like "public" would get
+        # re-encoded from scratch in every single batch instead of once for
+        # the whole corpus). Defaults to a fresh one-call-only cache
+        # otherwise, unchanged from before.
+        if cache is None:
+            cache = {}
         chunks = java_chunks(text)
         # show_progress is opt-in (default off) -- fine to skip for a single
         # short prompt (generate.py), but ensure_bins() encoding a
@@ -374,6 +415,79 @@ class JavaBPETokenizer:
         if add_eos:
             ids.append(self.special_tokens["<eos>"])
         return ids
+
+    def encode_file_streaming(self, corpus_path: str, dtype, train_path: str, val_path: str,
+                               split_frac: float = 0.9, batch_bytes: int = 256 * 1024 * 1024):
+        """Tokenize corpus_path straight to train_path/val_path on disk, in
+        bounded-size batches, instead of one encode(open(path).read()) call
+        on the whole file.
+
+        Why this exists: plain encode() calls java_chunks() (a regex
+        findall) on its *entire* input in one shot. For an 18GB+ corpus
+        that's on the order of 4 billion separate Python string objects in
+        one list -- catastrophic memory use no matter how much RAM is
+        available (confirmed: pushed a 96GB Mac to 26GB of swap with zero
+        progress). Processing ~256MB at a time keeps each batch's chunk
+        count in the tens of millions -- comparable to what earlier, much
+        smaller corpora already handled fine in one shot -- while a cache
+        shared across every batch (not a fresh one per batch) still gets
+        full corpus-wide memoization, so repeated tokens like "public" or
+        ";" aren't re-encoded from scratch 70+ times over.
+
+        Train/val split is by input *byte* position, not exact output
+        token count -- whichever batch straddles the split_frac mark goes
+        entirely to one side. At batch_bytes=256MB against an 18GB+ corpus
+        that's under ~1.5% imprecision on the split ratio, not worth a
+        slower two-pass exact split.
+
+        Returns (train_token_count, val_token_count, corpus_sha1_hex).
+        """
+        corpus_size = os.path.getsize(corpus_path)
+        split_byte = int(split_frac * corpus_size)
+        cache: Dict[str, List[int]] = {}
+        train_tokens = 0
+        val_tokens = 0
+        corpus_hash = hashlib.sha1()
+        bytes_seen = 0
+
+        pbar = (tqdm(total=corpus_size, unit="B", unit_scale=True, desc="Tokenizing")
+                if _HAVE_TQDM else _FallbackByteProgress(corpus_size, desc="Tokenizing"))
+
+        with open(corpus_path, "rb") as f_in, \
+             open(train_path, "wb") as f_train, \
+             open(val_path, "wb") as f_val:
+
+            def flush(raw_lines):
+                nonlocal train_tokens, val_tokens
+                if not raw_lines:
+                    return
+                raw = b"".join(raw_lines)
+                text = raw.decode("utf-8", errors="ignore")
+                ids = self.encode(text, cache=cache)
+                arr = np.array(ids, dtype=dtype)
+                if bytes_seen <= split_byte:
+                    arr.tofile(f_train)
+                    train_tokens += len(arr)
+                else:
+                    arr.tofile(f_val)
+                    val_tokens += len(arr)
+                pbar.update(len(raw))
+
+            batch: List[bytes] = []
+            batch_size = 0
+            for line in f_in:
+                corpus_hash.update(line)
+                bytes_seen += len(line)
+                batch.append(line)
+                batch_size += len(line)
+                if batch_size >= batch_bytes:
+                    flush(batch)
+                    batch = []
+                    batch_size = 0
+            flush(batch)
+
+        pbar.close()
+        return train_tokens, val_tokens, corpus_hash.hexdigest()
 
     def decode(self, ids: List[int]) -> str:
         inv_special = {v: k for k, v in self.special_tokens.items()}
