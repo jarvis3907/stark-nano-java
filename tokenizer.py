@@ -417,7 +417,7 @@ class JavaBPETokenizer:
         return ids
 
     def encode_file_streaming(self, corpus_path: str, dtype, train_path: str, val_path: str,
-                               split_frac: float = 0.9, batch_bytes: int = 256 * 1024 * 1024):
+                               split_frac: float = 0.9, batch_bytes: int = 16 * 1024 * 1024):
         """Tokenize corpus_path straight to train_path/val_path on disk, in
         bounded-size batches, instead of one encode(open(path).read()) call
         on the whole file.
@@ -427,17 +427,26 @@ class JavaBPETokenizer:
         that's on the order of 4 billion separate Python string objects in
         one list -- catastrophic memory use no matter how much RAM is
         available (confirmed: pushed a 96GB Mac to 26GB of swap with zero
-        progress). Processing ~256MB at a time keeps each batch's chunk
-        count in the tens of millions -- comparable to what earlier, much
-        smaller corpora already handled fine in one shot -- while a cache
-        shared across every batch (not a fresh one per batch) still gets
-        full corpus-wide memoization, so repeated tokens like "public" or
-        ";" aren't re-encoded from scratch 70+ times over.
+        progress). Processing in bounded batches keeps each batch's chunk
+        count manageable -- comparable to what earlier, much smaller
+        corpora already handled fine in one shot -- while a cache shared
+        across every batch (not a fresh one per batch) still gets full
+        corpus-wide memoization, so repeated tokens like "public" or ";"
+        aren't re-encoded from scratch hundreds of times over.
+
+        batch_bytes=16MB (not larger) is deliberate: the progress bar only
+        updates once per flushed batch, so this is also the feedback
+        granularity -- at 256MB (an earlier version of this) a single slow
+        batch reads as "stuck at 0%, no rate shown yet" for however long
+        that batch takes, indistinguishable from a hang. 16MB trades a
+        little more per-batch overhead (join/decode/array-alloc/write, all
+        cheap relative to the actual encoding work) for an update every
+        few seconds instead of possibly several minutes.
 
         Train/val split is by input *byte* position, not exact output
         token count -- whichever batch straddles the split_frac mark goes
-        entirely to one side. At batch_bytes=256MB against an 18GB+ corpus
-        that's under ~1.5% imprecision on the split ratio, not worth a
+        entirely to one side. At batch_bytes=16MB against an 18GB+ corpus
+        that's under ~0.1% imprecision on the split ratio, not worth a
         slower two-pass exact split.
 
         Returns (train_token_count, val_token_count, corpus_sha1_hex).
