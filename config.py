@@ -139,7 +139,11 @@ CONFIG_10M = ModelConfig(
 
 CONFIG_100M = ModelConfig(
     name="stark-nano-java-100M",
-    vocab_size=8192,
+    vocab_size=16384,  # Round 4: corpus grew from ~500M Java-only tokens to ~18GB Java+Kotlin
+                        # (~81% Kotlin by volume) -- 8192 split across two languages compresses
+                        # each worse than 8192 dedicated to Java alone did. Doubled to match
+                        # CONFIG_1B's existing tier; adds only ~6.3M tied-embedding params at
+                        # n_embd=768.
     block_size=1024,  # Round 3: RunPod GPU has headroom, and Java classes routinely exceed 512 tokens
     n_layer=12,
     n_head=12,
