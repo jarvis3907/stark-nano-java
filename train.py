@@ -117,11 +117,14 @@ def ensure_bins(cfg: ModelConfig, tok: JavaBPETokenizer, data_dir: str):
             return dtype
 
     corpus_path = os.path.join(data_dir, "corpus.txt")
+    corpus_size_mb = os.path.getsize(corpus_path) / 1e6
+    print(f"Reading {corpus_path} ({corpus_size_mb:,.0f} MB) ...")
     with open(corpus_path, encoding="utf-8", errors="ignore") as f:
         text = f.read()
 
-    print("Tokenizing full corpus ...")
-    ids = tok.encode(text)
+    print("Tokenizing full corpus (this is the slow part on a large corpus -- "
+          "progress bar below tracks it) ...")
+    ids = tok.encode(text, show_progress=True)
     ids = np.array(ids, dtype=dtype)
     split = int(0.9 * len(ids))
     train_ids, val_ids = ids[:split], ids[split:]

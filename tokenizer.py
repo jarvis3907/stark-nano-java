@@ -137,6 +137,23 @@ class _FallbackProgress:
         print()  # newline after the last \r-updated line
 
 
+def _fallback_iter_progress(iterable: List[str], desc: str = "", every: int = 200_000):
+    """Like _FallbackProgress, but wraps a plain iteration (encode()'s chunk
+    loop) instead of a fixed number of BPE merges -- no 'vocab=' postfix,
+    just count/percent/ETA against len(iterable)."""
+    total = len(iterable)
+    start = time.time()
+    for n, item in enumerate(iterable, 1):
+        yield item
+        if n % every == 0 or n == total:
+            elapsed = time.time() - start
+            rate = n / elapsed if elapsed > 0 else 0
+            remaining = (total - n) / rate if rate > 0 else 0
+            pct = 100 * n / total if total else 100
+            print(f"\r{desc} {n:,}/{total:,} ({pct:5.1f}%) ETA {remaining:5.0f}s", end="", flush=True)
+    print()
+
+
 class JavaBPETokenizer:
     """Byte-level BPE tokenizer with Java-aware pre-tokenization.
 
@@ -325,7 +342,8 @@ class JavaBPETokenizer:
             ids = _merge(ids, pair, self.merges[pair])
         return ids
 
-    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False) -> List[int]:
+    def encode(self, text: str, add_bos: bool = False, add_eos: bool = False,
+               show_progress: bool = False) -> List[int]:
         ids: List[int] = []
         if add_bos:
             ids.append(self.special_tokens["<bos>"])
@@ -338,7 +356,16 @@ class JavaBPETokenizer:
         # share cached lists by reference since callers only ever read them
         # here (extend), never mutate in place.
         cache: Dict[str, List[int]] = {}
-        for chunk in java_chunks(text):
+        chunks = java_chunks(text)
+        # show_progress is opt-in (default off) -- fine to skip for a single
+        # short prompt (generate.py), but ensure_bins() encoding a
+        # multi-GB corpus can run for a long time with zero other output,
+        # indistinguishable from a hang without this.
+        if show_progress and _HAVE_TQDM:
+            chunks = tqdm(chunks, desc="Encoding", unit="chunk", unit_scale=True)
+        elif show_progress:
+            chunks = _fallback_iter_progress(chunks, desc="Encoding")
+        for chunk in chunks:
             chunk_ids = cache.get(chunk)
             if chunk_ids is None:
                 chunk_ids = self._encode_chunk(chunk.encode("utf-8"))
