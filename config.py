@@ -174,17 +174,16 @@ TRAIN_10M = TrainConfig(
     eval_interval=250, eval_iters=50, sample_interval=500,
 )
 TRAIN_100M = TrainConfig(
-    # batch_size=64/grad_accum_steps=1: back to the original 64/1 split
-    # (product still 64, same effective batch / tokens-per-iter as the
-    # 32/2 it replaces -- this is a pure memory/speed trade, not a training
-    # change). 32/2 was for Round 3, to stay safely under 32GB VRAM once
-    # CONFIG_100M's block_size doubled (512 -> 1024, ~doubles per-sample
-    # activation memory). Round 4's GPU (RTX PRO 4500, 33.7GB) has a bit
-    # more headroom, but also doubled vocab_size (8192 -> 16384) on top of
-    # the same block_size=1024, which adds real memory pressure of its own
-    # (the loss/logits tensor scales with batch * block_size * vocab_size)
-    # -- if this OOMs, drop back to batch_size=32, grad_accum_steps=2.
-    batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
+    # batch_size=32/grad_accum_steps=2 (back from a 64/1 attempt for round
+    # 4): confirmed OOM on RunPod (RTX PRO 4500, 31.37GiB actual capacity)
+    # -- the iter-0 eval (no_grad(), doesn't retain activations for
+    # backprop) fit fine at 64 and even checkpointed, but the first real
+    # training step failed 256MiB short of the full 31.37GiB, inside the
+    # SwiGLU MLP's up_proj. Close, not wildly over -- 32/2 has a
+    # comfortable margin, not just barely enough. Product (effective
+    # batch/tokens-per-iter) is unchanged either way, so nothing else
+    # (max_iters, LR schedule) needs to move with it.
+    batch_size=32, grad_accum_steps=2, learning_rate=3e-4, min_lr=3e-5,
     # Round 4: max_iters/lr_decay_iters 40000 -> 75000 for the actual
     # prepared corpus (data/meta.json: train_tokens=4,951,166,626). 75000 *
     # 65536 tokens/iter = 4,915,200,000 -- 99.3% of one full epoch, and a
