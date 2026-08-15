@@ -181,8 +181,16 @@ TRAIN_100M = TrainConfig(
     # under 32GB VRAM. Raise batch_size and lower grad_accum_steps back up
     # (keeping their product at 64) if you confirm more headroom than this.
     batch_size=32, grad_accum_steps=2, learning_rate=3e-4, min_lr=3e-5,
-    max_iters=40000, warmup_iters=500, lr_decay_iters=40000,
-    eval_interval=500, eval_iters=100, sample_interval=1000,
+    # Round 4: max_iters/lr_decay_iters 40000 -> 70000 for the ~5B-token
+    # Java+Kotlin corpus (~4.5B train after the 90/10 split) -- targets
+    # roughly 1 epoch (70000 * 65536 tokens/iter =~ 4.59B) instead of
+    # round 3's ~5.4 epochs over its much smaller 487.7M-token corpus.
+    # eval_interval 500 -> 750 alongside it: unchanged would mean ~140
+    # evals instead of round 3's 80, each costing eval_iters(100) * 2
+    # splits of extra forward passes -- 750 keeps eval overhead roughly
+    # proportional to before (~93 evals total).
+    max_iters=70000, warmup_iters=500, lr_decay_iters=70000,
+    eval_interval=750, eval_iters=100, sample_interval=1000,
 )
 TRAIN_1B = TrainConfig(
     batch_size=4, grad_accum_steps=32, learning_rate=1.5e-4, min_lr=1.5e-5,
