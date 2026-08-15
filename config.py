@@ -174,13 +174,17 @@ TRAIN_10M = TrainConfig(
     eval_interval=250, eval_iters=50, sample_interval=500,
 )
 TRAIN_100M = TrainConfig(
-    # batch_size=32/grad_accum_steps=2 keeps the same effective batch (64) as
-    # the earlier 64/1 split. Halved from 64/1 for Round 3: CONFIG_100M's
-    # block_size doubled (512 -> 1024), which roughly doubles per-sample
-    # activation memory, so batch_size needed to come down to stay safely
-    # under 32GB VRAM. Raise batch_size and lower grad_accum_steps back up
-    # (keeping their product at 64) if you confirm more headroom than this.
-    batch_size=32, grad_accum_steps=2, learning_rate=3e-4, min_lr=3e-5,
+    # batch_size=64/grad_accum_steps=1: back to the original 64/1 split
+    # (product still 64, same effective batch / tokens-per-iter as the
+    # 32/2 it replaces -- this is a pure memory/speed trade, not a training
+    # change). 32/2 was for Round 3, to stay safely under 32GB VRAM once
+    # CONFIG_100M's block_size doubled (512 -> 1024, ~doubles per-sample
+    # activation memory). Round 4's GPU (RTX PRO 4500, 33.7GB) has a bit
+    # more headroom, but also doubled vocab_size (8192 -> 16384) on top of
+    # the same block_size=1024, which adds real memory pressure of its own
+    # (the loss/logits tensor scales with batch * block_size * vocab_size)
+    # -- if this OOMs, drop back to batch_size=32, grad_accum_steps=2.
+    batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
     # Round 4: max_iters/lr_decay_iters 40000 -> 70000 for the ~5B-token
     # Java+Kotlin corpus (~4.5B train after the 90/10 split) -- targets
     # roughly 1 epoch (70000 * 65536 tokens/iter =~ 4.59B) instead of
