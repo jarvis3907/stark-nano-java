@@ -185,15 +185,18 @@ TRAIN_100M = TrainConfig(
     # (the loss/logits tensor scales with batch * block_size * vocab_size)
     # -- if this OOMs, drop back to batch_size=32, grad_accum_steps=2.
     batch_size=64, grad_accum_steps=1, learning_rate=3e-4, min_lr=3e-5,
-    # Round 4: max_iters/lr_decay_iters 40000 -> 70000 for the ~5B-token
-    # Java+Kotlin corpus (~4.5B train after the 90/10 split) -- targets
-    # roughly 1 epoch (70000 * 65536 tokens/iter =~ 4.59B) instead of
-    # round 3's ~5.4 epochs over its much smaller 487.7M-token corpus.
-    # eval_interval 500 -> 750 alongside it: unchanged would mean ~140
+    # Round 4: max_iters/lr_decay_iters 40000 -> 75000 for the actual
+    # prepared corpus (data/meta.json: train_tokens=4,951,166,626). 75000 *
+    # 65536 tokens/iter = 4,915,200,000 -- 99.3% of one full epoch, and a
+    # clean multiple of eval_interval (below) so the last eval lands
+    # exactly on the final iteration. Round 3 ran ~5.4 epochs over its much
+    # smaller 487.7M-token corpus; this targets ~1 for the same
+    # overtraining-a-small-model reasoning discussed for round 4.
+    # eval_interval 500 -> 750 alongside it: unchanged would mean ~150
     # evals instead of round 3's 80, each costing eval_iters(100) * 2
     # splits of extra forward passes -- 750 keeps eval overhead roughly
-    # proportional to before (~93 evals total).
-    max_iters=70000, warmup_iters=500, lr_decay_iters=70000,
+    # proportional to before (100 evals total).
+    max_iters=75000, warmup_iters=500, lr_decay_iters=75000,
     eval_interval=750, eval_iters=100, sample_interval=1000,
 )
 TRAIN_1B = TrainConfig(
