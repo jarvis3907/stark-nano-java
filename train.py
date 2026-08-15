@@ -236,7 +236,22 @@ def get_batch(split, data_dir, dtype, block_size, batch_size, device):
     x = torch.stack([torch.from_numpy(data[i:i + block_size].astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + block_size].astype(np.int64)) for i in ix])
     if device.startswith("cuda"):
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        # No .pin_memory(): pinning a *freshly created* tensor on every call
+        # (this runs ~65,000 times over a 29,000-iter run: grad_accum
+        # micro-steps + eval_iters*2 splits per eval) grows PyTorch's
+        # pinned-memory cache roughly unboundedly instead of reusing one
+        # buffer -- confirmed root cause of a RunPod OOM-kill (container
+        # cgroup memory.max, ~62GB, silently exceeded with zero traceback).
+        # A real fix would double-buffer pinned memory across calls, but
+        # that requires getting CUDA-stream synchronization exactly right --
+        # reusing a buffer while its async transfer is still in flight
+        # would silently corrupt training data, worse than a crash. Given
+        # these tensors are tiny (batch_size*block_size*8 bytes, ~256KB
+        # each at this preset), the transfer-speed benefit of pinning is
+        # negligible anyway, so just skip it. (non_blocking only has any
+        # effect from pinned memory -- dropped it here too, it'd silently
+        # no-op otherwise and just confuse a future reader.)
+        x, y = x.to(device), y.to(device)
     else:
         x, y = x.to(device), y.to(device)
     return x, y
