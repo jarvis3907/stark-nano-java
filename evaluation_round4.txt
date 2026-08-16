@@ -1,0 +1,146 @@
+🦾 Round 4 Evaluation
+============================================================
+
+Test: Basic POJO
+----------------------------------------
+Loaded stark-nano-java-100M (iter 73500, val_loss=0.8543)
+
+===== sample 1/1 =====
+public class User {
+    private Long id;
+    private String name;
+    private String email;
+    private Integer age;
+    private String address;
+
+    @Column(name = "user_roles")
+    @Size(max = 50)
+    private List<String> roles = new ArrayList<>();
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    
+
+============================================================
+
+Test: REST Controller
+----------------------------------------
+Loaded stark-nano-java-100M (iter 73500, val_loss=0.8543)
+
+===== sample 1/1 =====
+@RestController
+public class UserController {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @PostMapping("/register")
+    public ResponseEntity<User> register(@RequestBody User user) {
+        return ResponseEntity(userRepository.save(user), HttpStatus.OK);
+    }
+
+    @GetMapping("/all")
+    public ResponseEntity<List<User>> getAll() {
+        return ResponseEntity(userRepository.findAll(), HttpStatus.OK);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<User> getById(@PathVariable("id") Long id) {
+        return ResponseEntity(userRepository.findById(id).orElse(null), HttpStatus.OK);
+    }
+
+    @GetMapping(
+
+============================================================
+
+Test: JPA Entity
+----------------------------------------
+Loaded stark-nano-java-100M (iter 73500, val_loss=0.8543)
+
+===== sample 1/1 =====
+@Entity
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private Long id;
+
+    private String name;
+
+    @OneToMany(fetch = FetchType.EAGER, mappedBy = "product")
+    private List<Product> products;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public List<Product> getProducts() {
+        return products;
+    }
+
+    public 
+
+============================================================
+
+Test: Spring Service
+----------------------------------------
+Loaded stark-nano-java-100M (iter 73500, val_loss=0.8543)
+
+===== sample 1/1 =====
+@Service
+public class OrderService {
+
+    public OrderService(OrderRepository orderRepository) {
+        this.orderRepository = orderRepository;
+    }
+
+    public List<Book> getBooks(String id) {
+        return orderRepository.findAllByPageable(Pageable.unpaged())
+          .map(order -> order.getBooks());
+    }
+
+    public List<Book> getBooksByTitle(String title) {
+        return orderRepository.findAllByTitleOrderByPriceIsDesc(title, false);
+    }
+
+    public void addBook(Book book) {
+        orderRepository.save(book);
+    }
+
+    public void updateBook(Book book) {
+        orderRepository.save((Order) book);
+    }
+
+    public 
+
+============================================================
+
